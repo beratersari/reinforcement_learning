@@ -23,6 +23,19 @@
     "epsilon_decay": 0.995,
     "hidden_sizes": [128, 128]
   },
+
+  "dqn": {
+    "lr": 0.0005,
+    "gamma": 0.95,
+    "batch_size": 128,
+    "buffer_size": 100000,
+    "update_every": 4,
+    "tau": 0.001,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.05,
+    "epsilon_decay": 0.995,
+    "hidden_sizes": [128, 128]
+  },
   
   "rewards": {
     "collision": 100,

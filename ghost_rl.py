@@ -421,6 +421,11 @@ class MultiGhostQLearning:
                 agent.load(path)
             else:
                 print(f"No Q-table found for ghost {i} at {path}")
+    
+    def get_epsilon(self) -> float:
+        if not self.agents:
+            return 0.0
+        return float(np.mean([agent.epsilon for agent in self.agents]))
 
 
 # ============================================================================
@@ -658,6 +663,11 @@ class MultiGhostMADDPG:
             if os.path.exists(critic_path):
                 agent.critic.load_state_dict(torch.load(critic_path))
 
+    def get_epsilon(self) -> float:
+        if not self.agents:
+            return 0.0
+        return float(np.mean([agent.epsilon for agent in self.agents]))
+
 
 
 # ============================================================================
@@ -679,3 +689,227 @@ def execute_action(pos: Tuple[int, int],
         new_pos = pos  # Stay in place
     
     return new_pos, valid
+
+# ============================================================================
+# DEEP Q-LEARNING (DQN)
+# ============================================================================
+class QNetwork(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_sizes: List[int]):
+        super().__init__()
+        layers = []
+        last = input_dim
+        for size in hidden_sizes:
+            layers.append(nn.Linear(last, size))
+            layers.append(nn.ReLU())
+            last = size
+        layers.append(nn.Linear(last, output_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class SharedDQN:
+    def __init__(self, state_dim: int, action_dim: int, hidden_sizes: List[int],
+                 lr: float, gamma: float, buffer_size: int, batch_size: int,
+                 update_every: int, tau: float):
+        self.q_network = QNetwork(state_dim, action_dim, hidden_sizes)
+        self.target_network = QNetwork(state_dim, action_dim, hidden_sizes)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.criterion = nn.MSELoss()
+
+        self.gamma = gamma
+        self.buffer = ReplayBuffer(buffer_size)
+        self.batch_size = batch_size
+        self.update_every = update_every
+        self.tau = tau
+        self.timestep = 0
+        self.action_dim = action_dim
+
+    def select_action(self, state: np.ndarray, epsilon: float, training: bool = True) -> int:
+        if training and np.random.random() < epsilon:
+            return int(np.random.choice(self.action_dim))
+
+        state_t = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.q_network(state_t)
+        return int(torch.argmax(q_values, dim=1).item())
+
+    def store_transition(self, state, action, reward, next_state, done):
+        self.buffer.push(state, action, reward, next_state, done)
+
+    def step(self):
+        self.timestep += 1
+        if len(self.buffer) >= self.batch_size and self.timestep % self.update_every == 0:
+            self._learn()
+
+    def _learn(self):
+        states, actions, rewards, next_states, dones = self.buffer.sample(self.batch_size)
+
+        states_t = torch.FloatTensor(states)
+        actions_t = torch.LongTensor(actions).unsqueeze(1)
+        rewards_t = torch.FloatTensor(rewards).unsqueeze(1)
+        next_states_t = torch.FloatTensor(next_states)
+        dones_t = torch.FloatTensor(dones).unsqueeze(1)
+
+        q_expected = self.q_network(states_t).gather(1, actions_t)
+
+        with torch.no_grad():
+            q_next = self.target_network(next_states_t).max(1)[0].unsqueeze(1)
+            q_target = rewards_t + (self.gamma * q_next * (1 - dones_t))
+
+        loss = self.criterion(q_expected, q_target)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        for target_param, local_param in zip(self.target_network.parameters(), self.q_network.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+
+
+class DQNGhostAgent:
+    def __init__(self, ghost_id: int, epsilon_start: float, epsilon_min: float, epsilon_decay: float):
+        self.ghost_id = ghost_id
+        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.total_reward = 0
+        self.episode_rewards = []
+
+    def decay_epsilon(self):
+        self.episode_rewards.append(self.total_reward)
+        self.total_reward = 0
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def reset_episode(self):
+        self.total_reward = 0
+
+
+class MultiGhostDQN:
+    """Shared-network DQN wrapper for ghosts with ghost_id in state."""
+    def __init__(self, num_ghosts: int, state_dim: int, action_dim: int, config: dict,
+                 repeat_window: int = REPEAT_PATTERN_WINDOW,
+                 repeat_threshold: int = REPEAT_PATTERN_THRESHOLD,
+                 repeat_penalty: float = REWARD_REPEAT):
+        dqn_cfg = config.get("dqn", {})
+        hidden_sizes = dqn_cfg.get("hidden_sizes", [128, 128])
+
+        self.shared_dqn = SharedDQN(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_sizes=hidden_sizes,
+            lr=dqn_cfg.get("lr", 0.0005),
+            gamma=dqn_cfg.get("gamma", 0.95),
+            buffer_size=dqn_cfg.get("buffer_size", 100000),
+            batch_size=dqn_cfg.get("batch_size", 128),
+            update_every=dqn_cfg.get("update_every", 4),
+            tau=dqn_cfg.get("tau", 0.001),
+        )
+
+        self.agents = [
+            DQNGhostAgent(
+                ghost_id=i,
+                epsilon_start=dqn_cfg.get("epsilon_start", 1.0),
+                epsilon_min=dqn_cfg.get("epsilon_min", 0.05),
+                epsilon_decay=dqn_cfg.get("epsilon_decay", 0.995),
+            )
+            for i in range(num_ghosts)
+        ]
+        self.num_ghosts = num_ghosts
+        self.shared_collision = True
+
+        # Reward helpers to reuse Q-learning shaping logic
+        self.reward_helpers = [
+            QLearningGhost(
+                ghost_id=i,
+                repeat_window=repeat_window,
+                repeat_threshold=repeat_threshold,
+                repeat_penalty=repeat_penalty
+            )
+            for i in range(num_ghosts)
+        ]
+
+    def _augment_state(self, state: Tuple[int, ...], ghost_id: int) -> np.ndarray:
+        one_hot = np.zeros(self.num_ghosts, dtype=np.float32)
+        if 0 <= ghost_id < self.num_ghosts:
+            one_hot[ghost_id] = 1.0
+        return np.concatenate([np.array(state, dtype=np.float32), one_hot])
+
+    def get_actions(self, states: List[Tuple[int, ...]], training: bool = True) -> List[int]:
+        actions = []
+        for agent, state in zip(self.agents, states):
+            augmented_state = self._augment_state(state, agent.ghost_id)
+            action = self.shared_dqn.select_action(augmented_state, agent.epsilon, training=training)
+            actions.append(action)
+        return actions
+
+    def update_all(self, states, actions, rewards, next_states, done):
+        for i, agent in enumerate(self.agents):
+            augmented_state = self._augment_state(states[i], agent.ghost_id)
+            augmented_next_state = self._augment_state(next_states[i], agent.ghost_id)
+            self.shared_dqn.store_transition(
+                augmented_state,
+                actions[i],
+                rewards[i],
+                augmented_next_state,
+                done
+            )
+            agent.total_reward += rewards[i]
+
+        self.shared_dqn.step()
+
+        if done:
+            for agent in self.agents:
+                agent.decay_epsilon()
+
+    def compute_rewards(self,
+                        old_positions: List[Tuple[int, int]],
+                        new_positions: List[Tuple[int, int]],
+                        pacman_pos: Tuple[int, int],
+                        collision: bool,
+                        pellets_done: bool,
+                        valid_moves: List[bool]) -> List[float]:
+        rewards = []
+        for i, (old_pos, new_pos, valid) in enumerate(zip(old_positions, new_positions, valid_moves)):
+            helper = self.reward_helpers[i]
+            r = helper.compute_reward(old_pos, new_pos, pacman_pos, collision, pellets_done, valid)
+            rewards.append(r)
+
+        if collision and self.shared_collision:
+            for i in range(len(rewards)):
+                rewards[i] = max(rewards[i], REWARD_COLLISION)
+
+        return rewards
+
+    def reset_all(self):
+        for helper in self.reward_helpers:
+            helper.reset_episode()
+        for agent in self.agents:
+            agent.reset_episode()
+
+    def get_epsilon(self) -> float:
+        if not self.agents:
+            return 0.0
+        return float(np.mean([agent.epsilon for agent in self.agents]))
+
+    def save_all(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, "shared_dqn.pt")
+        torch.save({
+            "q_network": self.shared_dqn.q_network.state_dict(),
+            "target_network": self.shared_dqn.target_network.state_dict(),
+        }, path)
+
+    def load_all(self, directory: str):
+        path = os.path.join(directory, "shared_dqn.pt")
+        if os.path.exists(path):
+            payload = torch.load(path)
+            if isinstance(payload, dict) and "q_network" in payload:
+                self.shared_dqn.q_network.load_state_dict(payload["q_network"])
+                self.shared_dqn.target_network.load_state_dict(payload.get("target_network", payload["q_network"]))
+            else:
+                self.shared_dqn.q_network.load_state_dict(payload)
+                self.shared_dqn.target_network.load_state_dict(self.shared_dqn.q_network.state_dict())

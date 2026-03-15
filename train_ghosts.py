@@ -32,6 +32,7 @@ import argparse
 import os
 import numpy as np
 import sys
+from collections import deque
 from typing import Optional
 
 # Import game components
@@ -41,7 +42,7 @@ from pacman_game import (
     bfs_path, manhattan_distance
 )
 from ghost_rl import (
-    MultiGhostQLearning, MultiGhostMADDPG, QLearningGhost,
+    MultiGhostQLearning, MultiGhostMADDPG, MultiGhostDQN, QLearningGhost,
     encode_state, execute_action,
     ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTIONS
 )
@@ -101,6 +102,18 @@ def load_config(config_path: str = None) -> dict:
             "epsilon_decay": 0.995,
             "hidden_sizes": [128, 128],
         },
+        "dqn": {
+            "lr": 0.0005,
+            "gamma": 0.95,
+            "batch_size": 128,
+            "buffer_size": 100000,
+            "update_every": 4,
+            "tau": 0.001,
+            "epsilon_start": 1.0,
+            "epsilon_min": 0.05,
+            "epsilon_decay": 0.995,
+            "hidden_sizes": [128, 128],
+        },
         "rewards": {
             "collision": 100,
             "pellets_done": -100,
@@ -143,7 +156,7 @@ def load_config(config_path: str = None) -> dict:
                 user_config = json.load(f)
             
             # Deep merge user config into defaults
-            for section in ["q_learning", "maddpg", "rewards", "repeat_detection", "state", "training", "coordination", "team_rewards"]:
+            for section in ["q_learning", "maddpg", "dqn", "rewards", "repeat_detection", "state", "training", "coordination", "team_rewards"]:
                 if section in user_config:
                     config[section].update(user_config[section])
             
@@ -202,6 +215,18 @@ def log_config(config: dict, train_map: int, test_map: int,
     logger.info(f"[MADDPG] Update Every: {maddpg.get('update_every', 1)}")
     logger.info(f"[MADDPG] Epsilon: start={maddpg.get('epsilon_start', 0.2)}, min={maddpg.get('epsilon_min', 0.02)}, decay={maddpg.get('epsilon_decay', 0.995)}")
     logger.info(f"[MADDPG] Hidden Sizes: {maddpg.get('hidden_sizes', [128, 128])}")
+
+    # DQN hyperparameters
+    dqn = config.get("dqn", {})
+    logger.info(f"[DQN] LR: {dqn.get('lr', 0.0005)}")
+    logger.info(f"[DQN] Gamma: {dqn.get('gamma', 0.95)}")
+    logger.info(f"[DQN] Batch Size: {dqn.get('batch_size', 128)}")
+    logger.info(f"[DQN] Buffer Size: {dqn.get('buffer_size', 100000)}")
+    logger.info(f"[DQN] Update Every: {dqn.get('update_every', 4)}")
+    logger.info(f"[DQN] Tau: {dqn.get('tau', 0.001)}")
+    logger.info(f"[DQN] Epsilon: start={dqn.get('epsilon_start', 1.0)}, min={dqn.get('epsilon_min', 0.05)}, decay={dqn.get('epsilon_decay', 0.995)}")
+    logger.info(f"[DQN] Hidden Sizes: {dqn.get('hidden_sizes', [128, 128])}")
+
     
     # Rewards
     logger.info(f"[REWARD] Collision: {rw.get('collision', 100)}")
@@ -241,7 +266,8 @@ class RLTrainingEnvironment:
     def __init__(self, render: bool = False, fps: int = 10, num_ghosts: int = 4,
                  train_map: int = 0, test_map: Optional[int] = None,
                  config: dict = None, config_path: str = None,
-                 model_type: str = "qlearning"):
+                 model_type: str = "qlearning", log_moves: bool = False,
+                 train_random_map: bool = False):
         """
         Initialize training environment.
         
@@ -253,13 +279,24 @@ class RLTrainingEnvironment:
             test_map: Map index for testing (defaults to train_map)
             config: Pre-loaded config dict (from load_config())
             config_path: Path to config.json (if config not provided)
-            model_type: 'qlearning' or 'maddpg' (from --model CLI arg)
+            model_type: 'qlearning', 'maddpg', or 'dqn'
+            log_moves: Enable logging of moves to file
+            train_random_map: If True, pick random training map each episode
         """
         self.render_mode = render
         self.fps = fps
         self.num_ghosts = num_ghosts
         self.train_map = train_map
         self.test_map = test_map if test_map is not None else train_map
+        self.train_random_map = train_random_map
+        self.log_moves_enabled = log_moves
+        self.log_file = "evaluation_moves.txt" if log_moves else None
+        
+        if self.log_moves_enabled:
+            with open(self.log_file, "w") as f:
+                f.write(f"Evaluation Log - Map: {self.test_map}, Ghosts: {self.num_ghosts}, Model: {model_type}\n")
+                f.write("Episode | Step | PacMan | Ghost 0 | Ghost 1 | Ghost 2 | Ghost 3 | Event\n")
+                f.write("-" * 100 + "\n")
         
         # Load config if not provided
         if config is None:
@@ -268,7 +305,7 @@ class RLTrainingEnvironment:
         
         # Model type from CLI arg (not config)
         self.model_type = model_type.lower()
-        if self.model_type not in ("qlearning", "maddpg"):
+        if self.model_type not in ("qlearning", "maddpg", "dqn"):
             logger.warning(f"Unknown model type '{model_type}', defaulting to qlearning")
             self.model_type = "qlearning"
         logger.info(f"[INIT] Model type: {self.model_type}")
@@ -379,6 +416,19 @@ class RLTrainingEnvironment:
                 repeat_threshold=self.repeat_threshold,
                 repeat_penalty=self.repeat_penalty
             )
+        elif self.model_type == "dqn":
+            state_dim = len(encode_state((0, 0), (0, 0), [], set(), [], GRID_SIZE)) + num_ghosts
+            action_dim = len(ACTIONS) + (1 if self.use_noop else 0)
+            
+            self.agents = MultiGhostDQN(
+                num_ghosts=num_ghosts,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                config=config,
+                repeat_window=self.repeat_window,
+                repeat_threshold=self.repeat_threshold,
+                repeat_penalty=self.repeat_penalty
+            )
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         
@@ -389,6 +439,9 @@ class RLTrainingEnvironment:
         self.wins_ghosts = 0
         self.episode_lengths = []
         self.episode_rewards_history = []
+        self.repeat_positions = [deque(maxlen=self.repeat_window) for _ in range(self.num_ghosts)]
+        self.repeat_strike_count = [0 for _ in range(self.num_ghosts)]
+        self.repeat_strike_limit = 8
         
         # Episode tracking (evaluation)
         self.eval_wins_pacman = 0
@@ -399,7 +452,8 @@ class RLTrainingEnvironment:
         # Store map names for reporting (with logging)
         self.train_map_name = self._get_map_name(self.train_map)
         self.test_map_name = self._get_map_name(self.test_map)
-        logger.info(f"[INIT] Train map: {self.train_map_name}")
+        train_map_label = "Random" if self.train_random_map else self.train_map_name
+        logger.info(f"[INIT] Train map: {train_map_label}")
         logger.info(f"[INIT] Test map:  {self.test_map_name}")
     
     def _get_map_name(self, map_idx: int) -> str:
@@ -418,11 +472,16 @@ class RLTrainingEnvironment:
         # FIX: Always force train_map for training (unless new_map cycling is intended)
         # For pure single-map training, keep on train_map
         if not new_map:
-            self.game.current_map_idx = self.train_map
+            if self.train_random_map:
+                self.game.current_map_idx = np.random.randint(0, len(self.game.maps))
+            else:
+                self.game.current_map_idx = self.train_map
         
         self.game._load_map(self.game.current_map_idx)
         self.game.reset()
         self.agents.reset_all()
+        self.repeat_positions = [deque(maxlen=self.repeat_window) for _ in range(self.num_ghosts)]
+        self.repeat_strike_count = [0 for _ in range(self.num_ghosts)]
         
         if self.episode == 0:
             logger.debug(f"[RESET] Episode reset complete on map: {self._get_map_name(self.game.current_map_idx)}")
@@ -437,6 +496,8 @@ class RLTrainingEnvironment:
         self.game._load_map(test_idx)
         self.game.reset()
         self.agents.reset_all()
+        self.repeat_positions = [deque(maxlen=self.repeat_window) for _ in range(self.num_ghosts)]
+        self.repeat_strike_count = [0 for _ in range(self.num_ghosts)]
         return self._get_states()
     
     def _get_states(self):
@@ -563,15 +624,90 @@ class RLTrainingEnvironment:
         
         # Move ghosts with RL actions
         valid_moves = []
+        occupied_positions = set(g.pos for g in self.game.ghosts)
+        prev_positions = list(old_ghost_positions)
+        line_axis = None
+        xs = [pos[0] for pos in prev_positions]
+        ys = [pos[1] for pos in prev_positions]
+        if len(prev_positions) >= 3:
+            if len(set(xs)) == 1:
+                line_axis = "x"
+            elif len(set(ys)) == 1:
+                line_axis = "y"
+        
         for i, (ghost, action) in enumerate(zip(self.game.ghosts, actions)):
+            # Temporarily remove current ghost from occupied set
+            occupied_positions.remove(ghost.pos)
+            
             new_pos, valid = execute_action(ghost.pos, action, self.game.walls, GRID_SIZE)
+            
+            line_locked = False
+            if line_axis == "x" and new_pos[0] == ghost.pos[0]:
+                line_locked = True
+            elif line_axis == "y" and new_pos[1] == ghost.pos[1]:
+                line_locked = True
+            
+            occupied_blocked = new_pos in occupied_positions
+            repeat_triggered = len(self.repeat_positions[i]) == self.repeat_window and new_pos in self.repeat_positions[i]
+            
+            if repeat_triggered:
+                self.repeat_strike_count[i] += 1
+            else:
+                self.repeat_strike_count[i] = 0
+            
+            needs_alternative = repeat_triggered or occupied_blocked or line_locked
+            
+            if needs_alternative:
+                if repeat_triggered and self.repeat_strike_count[i] >= self.repeat_strike_limit:
+                    new_pos = ghost.pos
+                    valid = False
+                else:
+                    alternative_actions = [a for a in ACTIONS if a != action]
+                    np.random.shuffle(alternative_actions)
+                    found_alternative = False
+                    for alt_action in alternative_actions:
+                        candidate_pos, candidate_valid = execute_action(ghost.pos, alt_action, self.game.walls, GRID_SIZE)
+                        
+                        if line_axis == "x" and candidate_pos[0] == ghost.pos[0]:
+                            candidate_valid = False
+                        elif line_axis == "y" and candidate_pos[1] == ghost.pos[1]:
+                            candidate_valid = False
+                        
+                        # Check collision with other ghosts for alternative move too
+                        if candidate_pos in occupied_positions:
+                            candidate_valid = False
+                            
+                        if candidate_valid and candidate_pos not in self.repeat_positions[i]:
+                            new_pos, valid = candidate_pos, candidate_valid
+                            found_alternative = True
+                            break
+                    
+                    if not found_alternative:
+                        if line_locked and not repeat_triggered and not occupied_blocked:
+                            valid = True
+                        else:
+                            new_pos = ghost.pos
+                            valid = False
+            
+            self.repeat_positions[i].append(new_pos)
             ghost.pos = new_pos
+            occupied_positions.add(new_pos)
             valid_moves.append(valid)
         
         # Move Pac-Man (heuristic AI)
         next_pm_pos = self.game.pacman.get_next_move(self.game.pellets, self.game.ghosts)
         if next_pm_pos:
             self.game.pacman.move(next_pm_pos)
+            
+        # Log moves if enabled
+        if self.log_moves_enabled and self.log_file:
+            try:
+                # Capture event status BEFORE checking collision/done flags, but we need
+                # to know if collision happened in this step. The collision logic is below.
+                # So we defer writing until we calculate collision.
+                pass 
+            except Exception as e:
+                logger.error(f"Failed to write log: {e}")
         
         # FIXED: Collision detection AFTER both move (catches position swaps)
         # Check 3 cases:
@@ -599,6 +735,23 @@ class RLTrainingEnvironment:
         # Check win/lose (including time limit)
         pellets_done = all(not p.active for p in self.game.pellets)
         time_expired = self.game.elapsed_time >= self.game.time_limit
+        
+        # Log moves NOW that we know the outcome
+        if self.log_moves_enabled and self.log_file:
+            try:
+                with open(self.log_file, "a") as f:
+                    ghost_pos_str = " | ".join([f"{str(g.pos):<8}" for g in self.game.ghosts])
+                    pm_pos = f"{str(self.game.pacman.pos):<8}"
+                    event = ""
+                    if collision: event = "COLLISION"
+                    elif pellets_done: event = "PACMAN_WIN"
+                    elif time_expired: event = "TIMEOUT"
+                    
+                    line = f"{self.episode:7d} | {int(self.game.elapsed_time*10):4d} | {pm_pos} | {ghost_pos_str} | {event}\n"
+                    f.write(line)
+            except Exception as e:
+                logger.error(f"Failed to write log: {e}")
+
         if time_expired:
             self.game.time_expired = True  # Mark for UI/popup
         done = collision or pellets_done or time_expired
@@ -732,6 +885,22 @@ class RLTrainingEnvironment:
         if self._line_penalty(new_positions):
             line_penalty = cfg.get("line_penalty", -1.2)
             rewards = [r + line_penalty for r in rewards]
+
+            # If ghosts line up, nudge them to break the line
+            xs = [p[0] for p in new_positions]
+            ys = [p[1] for p in new_positions]
+            line_axis = "x" if len(set(xs)) == 1 else "y"
+            for i, pos in enumerate(new_positions):
+                if line_axis == "x":
+                    if pos[0] > new_pm_pos[0] and ACTION_RIGHT in ACTIONS:
+                        rewards[i] += line_penalty * 0.5
+                    elif pos[0] < new_pm_pos[0] and ACTION_LEFT in ACTIONS:
+                        rewards[i] += line_penalty * 0.5
+                else:
+                    if pos[1] > new_pm_pos[1] and ACTION_DOWN in ACTIONS:
+                        rewards[i] += line_penalty * 0.5
+                    elif pos[1] < new_pm_pos[1] and ACTION_UP in ACTIONS:
+                        rewards[i] += line_penalty * 0.5
 
         # Overlap penalty: two ghosts in same cell
         overlap_penalty = cfg.get("overlap_penalty", -0.4)
@@ -961,8 +1130,8 @@ class RLTrainingEnvironment:
                 avg_reward = np.mean(recent_rewards) if recent_rewards else 0.0
                 win_rate = self.wins_ghosts / (self.wins_ghosts + self.wins_pacman + 1) * 100
                 epsilon_display = "n/a"
-                if self.model_type == "qlearning" and self.agents.agents:
-                    epsilon_display = f"{self.agents.agents[0].epsilon:.3f}"
+                if hasattr(self.agents, "get_epsilon"):
+                    epsilon_display = f"{self.agents.get_epsilon():.3f}"
                 logger.info(f"[PROGRESS] Ep {ep+1:5d} | AvgR: {avg_reward:8.1f} | "
                            f"GhostWin: {win_rate:5.1f}% | ε: {epsilon_display}")
             
@@ -1004,7 +1173,8 @@ class RLTrainingEnvironment:
         # TRAINING CONFIGURATION
         # =====================================================================
         print(f"\n┌─ TRAINING CONFIGURATION {'─'*44}┐")
-        print(f"│  Training Map:     {self.train_map_name:<40}│")
+        training_map_label = "Random" if self.train_random_map else self.train_map_name
+        print(f"│  Training Map:     {training_map_label:<40}│")
         print(f"│  Test Map:         {self.test_map_name:<40}│")
         print(f"│  Total Episodes:   {total_episodes:<40}│")
         print(f"│  Number of Ghosts: {self.num_ghosts:<40}│")
@@ -1175,7 +1345,7 @@ class RLTrainingEnvironment:
         import hashlib
         import json as json_module
         config_str = json_module.dumps({
-            "train_map": self.train_map,
+            "train_map": "random" if self.train_random_map else self.train_map,
             "num_ghosts": self.num_ghosts,
             "hyperparams": self.hyperparams,
             "episodes": total_episodes,
@@ -1202,6 +1372,9 @@ Examples:
   
   # Train on specific map (0-5)
   python train_ghosts.py --episodes 1000 --train-map 2 --save-dir models_m2/
+  
+  # Train on random maps
+  python train_ghosts.py --episodes 1000 --train-random-map --save-dir models_random/
   
   # Train on map 0, test on map 3
   python train_ghosts.py --episodes 1000 --train-map 0 --test-map 3 --save-dir models_m0_t3/
@@ -1231,6 +1404,8 @@ Examples:
     # ========================================================================
     parser.add_argument("--train-map", type=int, default=0,
                         help="[MAP] Map index for training, 0-5 (default: 0)")
+    parser.add_argument("--train-random-map", action="store_true",
+                        help="[MAP] Train on random map each episode (ignores --train-map)")
     parser.add_argument("--test-map", type=int, default=None,
                         help="[MAP] Map index for testing (default: same as train-map)")
     
@@ -1246,8 +1421,8 @@ Examples:
     parser.add_argument("--config", type=str, default="config.json",
                         help="[TRAIN] Path to config.json for hyperparameters (default: config.json)")
     parser.add_argument("--model", type=str, default="qlearning",
-                        choices=["qlearning", "maddpg"],
-                        help="[MODEL] Algorithm: qlearning or maddpg (default: qlearning)")
+                        choices=["qlearning", "maddpg", "dqn"],
+                        help="[MODEL] Algorithm: qlearning, maddpg, or dqn (default: qlearning)")
     parser.add_argument("--eval-only", action="store_true",
                         help="[TRAIN] Run evaluation only (requires --load-dir)")
     
@@ -1260,6 +1435,8 @@ Examples:
                         help="[RENDER] Render every N episodes (e.g., --render-every 10)")
     parser.add_argument("--fps", type=int, default=10,
                         help="[RENDER] FPS when rendering (default: 10)")
+    parser.add_argument("--log-moves", action="store_true",
+                        help="[DEBUG] Log ghost and pacman moves to evaluation_moves.txt (eval-only)")
     
     args = parser.parse_args()
     
@@ -1296,7 +1473,9 @@ Examples:
         train_map=args.train_map,
         test_map=args.test_map,
         config=config,
-        model_type=args.model
+        model_type=args.model,
+        log_moves=args.log_moves,
+        train_random_map=args.train_random_map
     )
     
     # Log full config after init
