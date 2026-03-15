@@ -17,7 +17,11 @@ import numpy as np
 import json
 import os
 from typing import Dict, Tuple, Optional, List
-from collections import defaultdict
+from collections import defaultdict, deque
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 # ============================================================================
 # CONSTANTS
@@ -51,6 +55,11 @@ REWARD_PELLETS_EATEN = -100 # All ghosts get this when Pac-Man wins
 REWARD_CLOSER = 1           # Per step moving closer
 REWARD_FARTHER = -1         # Per step moving away
 REWARD_INVALID = -0.5       # Hit wall or invalid
+REWARD_REPEAT = -0.25       # Repeated movement pattern penalty
+
+# Repetition detection
+REPEAT_PATTERN_WINDOW = 4   # Track last 4 positions
+REPEAT_PATTERN_THRESHOLD = 2  # Penalize when oscillation detected
 
 # Q-learning hyperparameters
 DEFAULT_ALPHA = 0.1         # Learning rate
@@ -156,7 +165,15 @@ class QLearningGhost:
                  epsilon: float = DEFAULT_EPSILON,
                  epsilon_min: float = DEFAULT_EPSILON_MIN,
                  epsilon_decay: float = DEFAULT_EPSILON_DECAY,
-                 use_noop: bool = False):
+                 use_noop: bool = False,
+                 repeat_window: int = REPEAT_PATTERN_WINDOW,
+                 repeat_threshold: int = REPEAT_PATTERN_THRESHOLD,
+                 repeat_penalty: float = REWARD_REPEAT,
+                 reward_collision: float = REWARD_COLLISION,
+                 reward_pellets: float = REWARD_PELLETS_EATEN,
+                 reward_closer: float = REWARD_CLOSER,
+                 reward_farther: float = REWARD_FARTHER,
+                 reward_invalid: float = REWARD_INVALID):
         
         self.ghost_id = ghost_id
         self.alpha = alpha
@@ -165,6 +182,14 @@ class QLearningGhost:
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
         self.use_noop = use_noop
+        self.repeat_window = repeat_window
+        self.repeat_threshold = repeat_threshold
+        self.repeat_penalty = repeat_penalty
+        self.reward_collision = reward_collision
+        self.reward_pellets = reward_pellets
+        self.reward_closer = reward_closer
+        self.reward_farther = reward_farther
+        self.reward_invalid = reward_invalid
         
         # Q-table: defaultdict for sparse storage
         # Key: state tuple, Value: array of Q-values for each action
@@ -181,6 +206,8 @@ class QLearningGhost:
         self.episode_rewards = []
         self.steps = 0
         self.last_dist_to_pm = None  # For computing closer/farther reward
+        self.recent_positions = deque(maxlen=self.repeat_window)
+        self.repeat_penalty_count = 0
     
     def get_action(self, state: Tuple[int, ...], training: bool = True) -> int:
         """Epsilon-greedy action selection."""
@@ -222,11 +249,11 @@ class QLearningGhost:
         
         # Collision with Pac-Man (any ghost)
         if collision:
-            reward += REWARD_COLLISION
+            reward += self.reward_collision
         
         # Pac-Man ate all pellets (ghosts fail)
         if pellets_done:
-            reward += REWARD_PELLETS_EATEN
+            reward += self.reward_pellets
         
         # Distance-based reward
         if self.last_dist_to_pm is not None:
@@ -234,15 +261,23 @@ class QLearningGhost:
             new_dist = abs(new_pos[0] - pacman_pos[0]) + abs(new_pos[1] - pacman_pos[1])
             
             if new_dist < old_dist:
-                reward += REWARD_CLOSER
+                reward += self.reward_closer
             elif new_dist > old_dist:
-                reward += REWARD_FARTHER
+                reward += self.reward_farther
         
         self.last_dist_to_pm = abs(new_pos[0] - pacman_pos[0]) + abs(new_pos[1] - pacman_pos[1])
         
         # Invalid move penalty
         if not valid_move:
-            reward += REWARD_INVALID
+            reward += self.reward_invalid
+        
+        # Repetition penalty (oscillation or staying in place)
+        self.recent_positions.append(new_pos)
+        if len(self.recent_positions) == self.repeat_window:
+            unique_positions = len(set(self.recent_positions))
+            if unique_positions <= self.repeat_threshold:
+                reward += self.repeat_penalty
+                self.repeat_penalty_count += 1
         
         return reward
     
@@ -256,6 +291,8 @@ class QLearningGhost:
         self.total_reward = 0
         self.steps = 0
         self.last_dist_to_pm = None
+        self.recent_positions.clear()
+        self.repeat_penalty_count = 0
     
     def save(self, filepath: str):
         """Save Q-table to JSON."""
@@ -275,6 +312,7 @@ class QLearningGhost:
             "stats": {
                 "total_episodes": len(self.episode_rewards),
                 "avg_reward": np.mean(self.episode_rewards) if self.episode_rewards else 0,
+                "repeat_penalties": self.repeat_penalty_count,
             }
         }
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -315,6 +353,14 @@ class MultiGhostQLearning:
     def __init__(self, num_ghosts: int = 4, **q_params):
         self.agents = [QLearningGhost(i, **q_params) for i in range(num_ghosts)]
         self.shared_collision = True  # All ghosts get collision reward
+        self.repeat_window = q_params.get("repeat_window", REPEAT_PATTERN_WINDOW)
+        self.repeat_threshold = q_params.get("repeat_threshold", REPEAT_PATTERN_THRESHOLD)
+        self.repeat_penalty = q_params.get("repeat_penalty", REWARD_REPEAT)
+        self.reward_collision = q_params.get("reward_collision", REWARD_COLLISION)
+        self.reward_pellets = q_params.get("reward_pellets", REWARD_PELLETS_EATEN)
+        self.reward_closer = q_params.get("reward_closer", REWARD_CLOSER)
+        self.reward_farther = q_params.get("reward_farther", REWARD_FARTHER)
+        self.reward_invalid = q_params.get("reward_invalid", REWARD_INVALID)
     
     def get_actions(self, states: List[Tuple[int, ...]], training: bool = True) -> List[int]:
         """Get actions for all ghosts."""
@@ -375,6 +421,243 @@ class MultiGhostQLearning:
                 agent.load(path)
             else:
                 print(f"No Q-table found for ghost {i} at {path}")
+
+
+# ============================================================================
+# MADDPG (Multi-Agent Deep Deterministic Policy Gradient)
+# ============================================================================
+class Actor(nn.Module):
+    def __init__(self, input_dim: int, action_dim: int, hidden_sizes: List[int]):
+        super().__init__()
+        layers = []
+        last = input_dim
+        for size in hidden_sizes:
+            layers.append(nn.Linear(last, size))
+            layers.append(nn.ReLU())
+            last = size
+        layers.append(nn.Linear(last, action_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return torch.tanh(self.net(x))
+
+
+class Critic(nn.Module):
+    def __init__(self, input_dim: int, hidden_sizes: List[int]):
+        super().__init__()
+        layers = []
+        last = input_dim
+        for size in hidden_sizes:
+            layers.append(nn.Linear(last, size))
+            layers.append(nn.ReLU())
+            last = size
+        layers.append(nn.Linear(last, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size: int):
+        idx = np.random.choice(len(self.buffer), batch_size, replace=False)
+        batch = [self.buffer[i] for i in idx]
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return (np.array(states), np.array(actions), np.array(rewards),
+                np.array(next_states), np.array(dones))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class MADDPGAgent:
+    def __init__(self, state_dim: int, action_dim: int, hidden_sizes: List[int],
+                 actor_lr: float, critic_lr: float, gamma: float, tau: float,
+                 epsilon_start: float, epsilon_min: float, epsilon_decay: float):
+        self.actor = Actor(state_dim, action_dim, hidden_sizes)
+        self.actor_target = Actor(state_dim, action_dim, hidden_sizes)
+        self.critic = Critic(state_dim + action_dim, hidden_sizes)
+        self.critic_target = Critic(state_dim + action_dim, hidden_sizes)
+        
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        
+        self.actor_optim = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optim = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        
+        self.gamma = gamma
+        self.tau = tau
+        self.epsilon = epsilon_start
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.total_reward = 0
+        self.episode_rewards = []
+
+    def select_action(self, state: np.ndarray, training: bool = True):
+        state_t = torch.FloatTensor(state).unsqueeze(0)
+        action = self.actor(state_t).detach().cpu().numpy()[0]
+        if training:
+            noise = self.epsilon * np.random.randn(*action.shape)
+            action = np.clip(action + noise, -1.0, 1.0)
+        return action
+
+    def update(self, batch):
+        states, actions, rewards, next_states, dones = batch
+        states_t = torch.FloatTensor(states)
+        actions_t = torch.FloatTensor(actions)
+        rewards_t = torch.FloatTensor(rewards).unsqueeze(1)
+        next_states_t = torch.FloatTensor(next_states)
+        dones_t = torch.FloatTensor(dones).unsqueeze(1)
+        
+        self.total_reward += float(np.mean(rewards))
+        
+        # Critic update
+        with torch.no_grad():
+            next_actions = self.actor_target(next_states_t)
+            target_q = self.critic_target(torch.cat([next_states_t, next_actions], dim=1))
+            y = rewards_t + self.gamma * (1 - dones_t) * target_q
+        
+        current_q = self.critic(torch.cat([states_t, actions_t], dim=1))
+        critic_loss = nn.MSELoss()(current_q, y)
+        
+        self.critic_optim.zero_grad()
+        critic_loss.backward()
+        self.critic_optim.step()
+        
+        # Actor update
+        actor_loss = -self.critic(torch.cat([states_t, self.actor(states_t)], dim=1)).mean()
+        self.actor_optim.zero_grad()
+        actor_loss.backward()
+        self.actor_optim.step()
+        
+        # Soft update targets
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+
+    def decay_epsilon(self):
+        self.episode_rewards.append(self.total_reward)
+        self.total_reward = 0
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+
+class MultiGhostMADDPG:
+    """Multi-agent MADDPG wrapper for ghosts."""
+    def __init__(self, num_ghosts: int, state_dim: int, action_dim: int, config: dict,
+                 repeat_window: int = REPEAT_PATTERN_WINDOW,
+                 repeat_threshold: int = REPEAT_PATTERN_THRESHOLD,
+                 repeat_penalty: float = REWARD_REPEAT):
+        maddpg_cfg = config.get("maddpg", {})
+        hidden_sizes = maddpg_cfg.get("hidden_sizes", [128, 128])
+        
+        self.agents = [
+            MADDPGAgent(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_sizes=hidden_sizes,
+                actor_lr=maddpg_cfg.get("actor_lr", 0.0005),
+                critic_lr=maddpg_cfg.get("critic_lr", 0.001),
+                gamma=maddpg_cfg.get("gamma", 0.95),
+                tau=maddpg_cfg.get("tau", 0.01),
+                epsilon_start=maddpg_cfg.get("epsilon_start", 0.2),
+                epsilon_min=maddpg_cfg.get("epsilon_min", 0.02),
+                epsilon_decay=maddpg_cfg.get("epsilon_decay", 0.995),
+            )
+            for _ in range(num_ghosts)
+        ]
+        self.num_ghosts = num_ghosts
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.buffer = ReplayBuffer(maddpg_cfg.get("buffer_size", 100000))
+        self.batch_size = maddpg_cfg.get("batch_size", 128)
+        self.update_every = maddpg_cfg.get("update_every", 1)
+        self.timestep = 0
+        self.shared_collision = True
+        self.last_action_cont = [np.zeros(action_dim, dtype=np.float32) for _ in range(num_ghosts)]
+        
+        # Reward helpers to reuse Q-learning shaping logic
+        self.reward_helpers = [
+            QLearningGhost(
+                ghost_id=i,
+                repeat_window=repeat_window,
+                repeat_threshold=repeat_threshold,
+                repeat_penalty=repeat_penalty
+            )
+            for i in range(num_ghosts)
+        ]
+    
+    def get_actions(self, states: List[Tuple[int, ...]], training: bool = True) -> List[int]:
+        actions = []
+        for i, (agent, state) in enumerate(zip(self.agents, states)):
+            action_cont = agent.select_action(np.array(state, dtype=np.float32), training=training)
+            self.last_action_cont[i] = action_cont
+            action_idx = int(np.argmax(action_cont))
+            actions.append(action_idx)
+        return actions
+
+    def update_all(self, states, actions, rewards, next_states, done):
+        for i, agent in enumerate(self.agents):
+            self.buffer.push(states[i], self.last_action_cont[i], rewards[i], next_states[i], done)
+        
+        self.timestep += 1
+        if len(self.buffer) >= self.batch_size and self.timestep % self.update_every == 0:
+            batch = self.buffer.sample(self.batch_size)
+            for agent in self.agents:
+                agent.update(batch)
+        
+        if done:
+            for agent in self.agents:
+                agent.decay_epsilon()
+
+    def compute_rewards(self,
+                        old_positions: List[Tuple[int, int]],
+                        new_positions: List[Tuple[int, int]],
+                        pacman_pos: Tuple[int, int],
+                        collision: bool,
+                        pellets_done: bool,
+                        valid_moves: List[bool]) -> List[float]:
+        rewards = []
+        for i, (old_pos, new_pos, valid) in enumerate(zip(old_positions, new_positions, valid_moves)):
+            helper = self.reward_helpers[i]
+            r = helper.compute_reward(old_pos, new_pos, pacman_pos, collision, pellets_done, valid)
+            rewards.append(r)
+        
+        if collision and self.shared_collision:
+            for i in range(len(rewards)):
+                rewards[i] = max(rewards[i], REWARD_COLLISION)
+        
+        return rewards
+
+    def reset_all(self):
+        for helper in self.reward_helpers:
+            helper.reset_episode()
+        for agent in self.agents:
+            agent.total_reward = 0
+        self.last_action_cont = [np.zeros(self.action_dim, dtype=np.float32) for _ in range(self.num_ghosts)]
+
+    def save_all(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        for i, agent in enumerate(self.agents):
+            torch.save(agent.actor.state_dict(), os.path.join(directory, f"ghost_{i}_actor.pt"))
+            torch.save(agent.critic.state_dict(), os.path.join(directory, f"ghost_{i}_critic.pt"))
+
+    def load_all(self, directory: str):
+        for i, agent in enumerate(self.agents):
+            actor_path = os.path.join(directory, f"ghost_{i}_actor.pt")
+            critic_path = os.path.join(directory, f"ghost_{i}_critic.pt")
+            if os.path.exists(actor_path):
+                agent.actor.load_state_dict(torch.load(actor_path))
+            if os.path.exists(critic_path):
+                agent.critic.load_state_dict(torch.load(critic_path))
+
 
 
 # ============================================================================

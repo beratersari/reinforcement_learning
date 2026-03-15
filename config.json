@@ -1,0 +1,66 @@
+{
+  "_comment": "Training configuration for ghost agents. Use --model CLI arg for qlearning/maddpg.",
+  
+  "q_learning": {
+    "alpha": 0.1,
+    "gamma": 0.95,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.05,
+    "epsilon_decay": 0.995,
+    "use_noop": false
+  },
+  
+  "maddpg": {
+    "actor_lr": 0.0005,
+    "critic_lr": 0.001,
+    "gamma": 0.95,
+    "tau": 0.01,
+    "batch_size": 128,
+    "buffer_size": 100000,
+    "update_every": 1,
+    "epsilon_start": 0.2,
+    "epsilon_min": 0.02,
+    "epsilon_decay": 0.995,
+    "hidden_sizes": [128, 128]
+  },
+  
+  "rewards": {
+    "collision": 100,
+    "pellets_done": -100,
+    "closer": 1,
+    "farther": -1,
+    "invalid": -0.5,
+    "repeat": -0.25
+  },
+  
+  "repeat_detection": {
+    "window": 4,
+    "threshold": 2
+  },
+  
+  "state": {
+    "dist_bins": [0, 2, 4, 8, 16, 30],
+    "grid_size": 30
+  },
+  
+  "training": {
+    "max_steps_per_episode": 500,
+    "shared_collision_reward": true
+  },
+
+  "coordination": {
+    "enabled": true,
+    "vision_range": 8,
+    "surround": true
+  },
+
+  "team_rewards": {
+    "mobility": 1.5,
+    "adjacent_block": 0.75,
+    "spread": 0.5,
+    "cluster_penalty": -0.6,
+    "line_penalty": -5.2,
+    "overlap_penalty": -0.4,
+    "cluster_distance": 1
+  }
+}
