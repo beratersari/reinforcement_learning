@@ -1,4 +1,4 @@
-# Pac-Man RL Simulation
+# Pac-Man RL Simulation (QLearning)
 
 A Pac-Man simulation environment (30x30 grid) for training Q-learning ghost agents and evaluating them across multiple maps.
 
