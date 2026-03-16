@@ -1,6 +1,6 @@
 # Pac-Man RL Simulation (Multi-Agent)
 
-A customizable Pac-Man simulation environment (30x30 grid) for training and evaluating multi-agent Reinforcement Learning (RL) models. This project supports **Q-Learning**, **MADDPG**, and **Shared DQN** agents controlling the ghosts to capture Pac-Man.
+A customizable Pac-Man simulation environment (30x30 grid) for training and evaluating multi-agent Reinforcement Learning (RL) models. This project supports **Q-Learning**, **MADDPG**, **Shared DQN**, and **QMIX** (Factorized Q-Learning) agents controlling the ghosts to capture Pac-Man.
 
 ## Features
 
@@ -9,6 +9,7 @@ A customizable Pac-Man simulation environment (30x30 grid) for training and eval
   - **Q-Learning**: Independent tabular Q-learning per ghost.
   - **MADDPG**: Multi-Agent Deep Deterministic Policy Gradient (Actor-Critic).
   - **Shared DQN**: Deep Q-Network with shared weights and replay buffer, using ghost IDs for role differentiation.
+  - **QMIX**: Factorized Multi-Agent Q-Learning with centralized training and decentralized execution. Uses a mixing network to combine individual Q-values into joint Q-value.
 - **Coordination**: Built-in mechanisms for encirclement and trapping strategies.
 - **Reward Shaping**: Team-based rewards to encourage spacing, mobility reduction, and discourage clustering/line formations.
 - **Anti-Pattern Logic**: Hard overrides to prevent infinite loops (oscillations) and ghost-on-ghost collisions.
@@ -55,6 +56,16 @@ Train **MADDPG** on random maps:
 python train_ghosts.py --episodes 1000 --model maddpg --train-random-map --save-dir models_maddpg_random/
 ```
 
+Train **QMIX** (single map):
+```bash
+python train_ghosts.py --episodes 1000 --model qmix --save-dir models_qmix/
+```
+
+Train **QMIX** on random maps:
+```bash
+python train_ghosts.py --episodes 1000 --model qmix --train-random-map --save-dir models_qmix_random/
+```
+
 ### 3. Evaluate and Watch
 Watch the trained agents play (no training):
 ```bash
@@ -84,6 +95,19 @@ Hyperparameters are defined in `config.json`. You can override them or provide a
     "update_every": 4,
     "tau": 0.001,
     "hidden_sizes": [128, 128]
+  },
+  "qmix": {
+    "lr": 0.0005,
+    "gamma": 0.95,
+    "batch_size": 128,
+    "buffer_size": 100000,
+    "update_every": 4,
+    "tau": 0.005,
+    "epsilon_start": 1.0,
+    "epsilon_min": 0.05,
+    "epsilon_decay": 0.995,
+    "hidden_sizes": [128, 128],
+    "mixing_hidden": 64
   },
   "rewards": {
     "collision": 100,
@@ -125,6 +149,20 @@ Hyperparameters are defined in `config.json`. You can override them or provide a
 - **Mechanism**: Experience replay buffer is shared. Ghosts learn from each other's experiences while developing distinct roles via the ID input.
 - **Pros**: Data efficient, faster convergence, reduced memory usage.
 
+### 4. QMIX (Factorized Multi-Agent Q-Learning)
+- **Type**: Deep Multi-Agent RL.
+- **Structure**: Per-ghost Q-networks (individual utility functions) + shared **Mixing Network**.
+- **Mechanism**: 
+  - **Decentralized Execution**: Each ghost selects actions using its own Q-network independently.
+  - **Centralized Training**: A mixing network combines individual Q-values into a joint Q-value using a hypernetwork that generates weights from global state.
+  - **Monotonicity**: Mixing network uses absolute weights to ensure `argmax(Q_joint) = argmax(individual Qs)`, enabling decentralized execution.
+- **Input**: Individual state per ghost; global state (concatenation) for mixing network.
+- **Pros**: 
+  - Strong multi-agent coordination via joint Q-value optimization.
+  - Scales to larger teams better than independent Q-learning.
+  - Maintains decentralized execution efficiency.
+- **Cons**: More complex than Shared DQN; requires global state during training.
+
 ---
 
 ## Environment Mechanics
@@ -139,6 +177,22 @@ Each ghost observes a local state (9-dim tuple):
 
 **For DQN**: The state is augmented with a one-hot vector representing the ghost ID (e.g., `[0, 1, 0, 0]` for Ghost 1).
 
+### Partial Observability
+Controlled via `observation` config section:
+- **`range`**: Manhattan distance threshold for seeing Pac-Man (default: 30 = full observability)
+- **`shared_pacman`**: 
+  - `false` (default): Each ghost only observes PM if within their individual range
+  - `true`: Team mode - if ANY ghost within range sees PM, ALL ghosts get full PM info
+
+**Examples:**
+```json
+// Individual partial observability (each ghost limited by range)
+"observation": { "range": 8, "shared_pacman": false }
+
+// Team shared observability (any ghost within range shares PM with all)
+"observation": { "range": 8, "shared_pacman": true }
+```
+
 ### Anti-Pattern Logic (Hardcoded)
 To ensure robust behavior, the environment enforces:
 1. **No Overlaps**: Ghosts cannot move onto a cell occupied by another ghost (physically blocking).
@@ -151,7 +205,7 @@ To ensure robust behavior, the environment enforces:
 
 | Flag | Description |
 |------|-------------|
-| `--model` | Model type: `qlearning`, `maddpg`, `dqn`. |
+| `--model` | Model type: `qlearning`, `maddpg`, `dqn`, `qmix`. |
 | `--episodes` | Number of episodes to run. |
 | `--ghosts` | Number of ghosts (2 or 4). |
 | `--train-map` | Map index (0-5) for training. |

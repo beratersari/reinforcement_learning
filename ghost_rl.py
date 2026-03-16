@@ -97,22 +97,32 @@ def encode_state(ghost_pos: Tuple[int, int],
                  other_ghosts: List[Tuple[int, int]],
                  walls: set,
                  pellets: List,  # List of Pellet objects
-                 grid_size: int = 30) -> Tuple[int, ...]:
+                 grid_size: int = 30,
+                 observation_range: int = None) -> Tuple[int, ...]:
     """
     Encode game state into discrete tuple for Q-table lookup.
     
     Components:
-    - dist_pm: distance to Pac-Man (6 bins)
-    - dir_pm: direction to Pac-Man (4 dirs)
+    - dist_pm: distance to Pac-Man (6 bins, or max bin if out of observation range)
+    - dir_pm: direction to Pac-Man (4 dirs, or 4=unknown if out of range)
     - dist_ghost: distance to nearest other ghost (6 bins)
     - dir_ghost: direction to nearest other ghost (4 dirs, or 4 if none)
     - can_up/down/left/right: 4 binary (can move?)
     - pellet_near: is there pellet within 3 cells? (2 bins)
+    
+    Args:
+        observation_range: If set, Pac-Man beyond this Manhattan distance is "unknown"
     """
     # Distance and direction to Pac-Man
     dist_pm = abs(ghost_pos[0] - pacman_pos[0]) + abs(ghost_pos[1] - pacman_pos[1])
-    dist_pm_bin = discretize_distance(dist_pm)
-    dir_pm = get_direction(ghost_pos, pacman_pos)
+    
+    # Partial observability: if Pac-Man beyond observation range, encode as unknown
+    if observation_range is not None and dist_pm > observation_range:
+        dist_pm_bin = len(DIST_BINS) - 1  # Max/far bin
+        dir_pm = 4  # Unknown direction (5th value = no direction)
+    else:
+        dist_pm_bin = discretize_distance(dist_pm)
+        dir_pm = get_direction(ghost_pos, pacman_pos)
     
     # Nearest other ghost
     if other_ghosts:
@@ -913,3 +923,435 @@ class MultiGhostDQN:
             else:
                 self.shared_dqn.q_network.load_state_dict(payload)
                 self.shared_dqn.target_network.load_state_dict(self.shared_dqn.q_network.state_dict())
+
+
+# ============================================================================
+# QMIX (Factorized Multi-Agent Q-Learning)
+# ============================================================================
+class HyperNetwork(nn.Module):
+    """
+    Hypernetwork that generates weights for the mixing network.
+    Takes global state and outputs monotonic mixing weights.
+    """
+    def __init__(self, state_dim: int, n_agents: int, hidden_dim: int = 64):
+        super().__init__()
+        self.n_agents = n_agents
+        self.hidden_dim = hidden_dim
+        
+        # Hypernetwork for first layer weights (n_agents -> hidden_dim)
+        self.fc1_w = nn.Linear(state_dim, n_agents * hidden_dim)
+        self.fc1_b = nn.Linear(state_dim, hidden_dim)
+        
+        # Hypernetwork for second layer weights (hidden_dim -> 1)
+        self.fc2_w = nn.Linear(state_dim, hidden_dim)
+        self.fc2_b = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, state: torch.Tensor):
+        """
+        Generate mixing network parameters from global state.
+        Returns: fc1_w, fc1_b, fc2_w, fc2_b (all with abs() for monotonicity)
+        """
+        fc1_w = torch.abs(self.fc1_w(state))  # Ensure positive weights
+        fc1_b = self.fc1_b(state)
+        fc2_w = torch.abs(self.fc2_w(state))  # Ensure positive weights
+        fc2_b = self.fc2_b(state)
+        
+        # Reshape fc1_w to (batch, hidden_dim, n_agents)
+        fc1_w = fc1_w.view(-1, self.hidden_dim, self.n_agents)
+        fc2_w = fc2_w.view(-1, 1, self.hidden_dim)
+        
+        return fc1_w, fc1_b, fc2_w, fc2_b
+
+
+class MixingNetwork(nn.Module):
+    """
+    Monotonic mixing network that combines individual Q-values into joint Q-value.
+    The monotonicity constraint ensures decentralized action selection is optimal.
+    """
+    def __init__(self, n_agents: int, state_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.n_agents = n_agents
+        self.hidden_dim = hidden_dim
+        self.hypernet = HyperNetwork(state_dim, n_agents, hidden_dim)
+
+    def forward(self, individual_q: torch.Tensor, global_state: torch.Tensor):
+        """
+        Mix individual Q-values using hypernetwork-generated weights.
+        
+        Args:
+            individual_q: (batch, n_agents) - each agent's Q-value
+            global_state: (batch, state_dim) - global state representation
+        
+        Returns:
+            joint_q: (batch, 1) - mixed joint Q-value
+        """
+        fc1_w, fc1_b, fc2_w, fc2_b = self.hypernet(global_state)
+        
+        # First layer: individual_q @ fc1_w + fc1_b
+        # individual_q: (batch, n_agents) -> unsqueeze to (batch, n_agents, 1)
+        # fc1_w: (batch, hidden_dim, n_agents) -> permute to (batch, n_agents, hidden_dim)
+        # Result: (batch, 1, hidden_dim)
+        individual_q = individual_q.unsqueeze(-1)  # (batch, n_agents, 1)
+        hidden = torch.bmm(fc1_w, individual_q).squeeze(-1)  # (batch, hidden_dim)
+        hidden = hidden + fc1_b  # Add bias
+        hidden = torch.relu(hidden)  # ReLU for non-linearity
+        
+        # Second layer: hidden @ fc2_w + fc2_b
+        # hidden: (batch, hidden_dim) -> unsqueeze to (batch, hidden_dim, 1)
+        # fc2_w: (batch, 1, hidden_dim)
+        # Result: (batch, 1, 1) -> squeeze to (batch, 1)
+        hidden = hidden.unsqueeze(-1)  # (batch, hidden_dim, 1)
+        joint_q = torch.bmm(fc2_w, hidden).squeeze(-1)  # (batch, 1)
+        joint_q = joint_q + fc2_b  # Add final bias
+        
+        return joint_q
+
+
+class IndividualQNetwork(nn.Module):
+    """
+    Per-agent Q-network for QMIX.
+    Takes individual observation and outputs Q-values for each action.
+    """
+    def __init__(self, input_dim: int, action_dim: int, hidden_sizes: List[int]):
+        super().__init__()
+        layers = []
+        last = input_dim
+        for size in hidden_sizes:
+            layers.append(nn.Linear(last, size))
+            layers.append(nn.ReLU())
+            last = size
+        layers.append(nn.Linear(last, action_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class QMIXAgent:
+    """Individual QMIX agent with its own Q-network and target network."""
+    def __init__(self, ghost_id: int, state_dim: int, action_dim: int, 
+                 hidden_sizes: List[int], lr: float, gamma: float, tau: float):
+        self.ghost_id = ghost_id
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.tau = tau
+        
+        self.q_network = IndividualQNetwork(state_dim, action_dim, hidden_sizes)
+        self.target_network = IndividualQNetwork(state_dim, action_dim, hidden_sizes)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
+        self.epsilon = 1.0  # Will be set from config
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+        self.total_reward = 0
+        self.episode_rewards = []
+
+    def select_action(self, state: np.ndarray, training: bool = True) -> int:
+        if training and np.random.random() < self.epsilon:
+            return int(np.random.choice(self.action_dim))
+
+        state_t = torch.FloatTensor(state).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.q_network(state_t)
+        return int(torch.argmax(q_values, dim=1).item())
+
+    def soft_update_target(self):
+        """Soft update target network."""
+        for target_param, local_param in zip(self.target_network.parameters(), self.q_network.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+
+    def decay_epsilon(self):
+        self.episode_rewards.append(self.total_reward)
+        self.total_reward = 0
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def reset_episode(self):
+        self.total_reward = 0
+
+
+class MultiGhostQMIX:
+    """
+    QMIX: Factorized Multi-Agent Q-Learning.
+    
+    Key ideas:
+    - Each agent has individual Q-network (decentralized execution)
+    - Mixing network combines Q-values into joint Q (centralized training)
+    - Monotonicity constraint ensures individual argmax = joint argmax
+    - Hypernetwork generates mixing weights from global state
+    """
+    def __init__(self, num_ghosts: int, state_dim: int, action_dim: int, config: dict,
+                 repeat_window: int = REPEAT_PATTERN_WINDOW,
+                 repeat_threshold: int = REPEAT_PATTERN_THRESHOLD,
+                 repeat_penalty: float = REWARD_REPEAT):
+        qmix_cfg = config.get("qmix", {})
+        hidden_sizes = qmix_cfg.get("hidden_sizes", [128, 128])
+        mixing_hidden = qmix_cfg.get("mixing_hidden", 64)
+        
+        self.num_ghosts = num_ghosts
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.gamma = qmix_cfg.get("gamma", 0.95)
+        self.tau = qmix_cfg.get("tau", 0.005)
+        self.batch_size = qmix_cfg.get("batch_size", 128)
+        self.buffer_size = qmix_cfg.get("buffer_size", 100000)
+        self.update_every = qmix_cfg.get("update_every", 4)
+        self.lr = qmix_cfg.get("lr", 0.0005)
+        
+        # Per-agent Q-networks
+        self.agents = [
+            QMIXAgent(
+                ghost_id=i,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden_sizes=hidden_sizes,
+                lr=self.lr,
+                gamma=self.gamma,
+                tau=self.tau
+            )
+            for i in range(num_ghosts)
+        ]
+        
+        # Global state dimension = concat of all individual states
+        global_state_dim = state_dim * num_ghosts
+        
+        # Mixing network
+        self.mixing_network = MixingNetwork(num_ghosts, global_state_dim, mixing_hidden)
+        self.target_mixing_network = MixingNetwork(num_ghosts, global_state_dim, mixing_hidden)
+        self.target_mixing_network.load_state_dict(self.mixing_network.state_dict())
+        
+        self.mixing_optimizer = optim.Adam(self.mixing_network.parameters(), lr=self.lr)
+        
+        # Shared replay buffer
+        self.buffer = ReplayBuffer(self.buffer_size)
+        self.timestep = 0
+        self.shared_collision = True
+        
+        # Reward helpers for shaping
+        self.reward_helpers = [
+            QLearningGhost(
+                ghost_id=i,
+                repeat_window=repeat_window,
+                repeat_threshold=repeat_threshold,
+                repeat_penalty=repeat_penalty
+            )
+            for i in range(num_ghosts)
+        ]
+        
+        # Epsilon from first agent (will be synced)
+        self.epsilon_start = qmix_cfg.get("epsilon_start", 1.0)
+        self.epsilon_min = qmix_cfg.get("epsilon_min", 0.05)
+        self.epsilon_decay = qmix_cfg.get("epsilon_decay", 0.995)
+        
+        for agent in self.agents:
+            agent.epsilon = self.epsilon_start
+            agent.epsilon_min = self.epsilon_min
+            agent.epsilon_decay = self.epsilon_decay
+
+    def _build_global_state(self, states: List[Tuple[int, ...]]) -> np.ndarray:
+        """Build global state by concatenating all individual states."""
+        return np.concatenate([np.array(s, dtype=np.float32) for s in states])
+
+    def get_actions(self, states: List[Tuple[int, ...]], training: bool = True) -> List[int]:
+        """Decentralized action selection - each agent acts independently."""
+        actions = []
+        for agent, state in zip(self.agents, states):
+            action = agent.select_action(np.array(state, dtype=np.float32), training=training)
+            actions.append(action)
+        return actions
+
+    def update_all(self, states, actions, rewards, next_states, done):
+        """Centralized training update."""
+        # Build global states
+        global_state = self._build_global_state(states)
+        global_next_state = self._build_global_state(next_states)
+        
+        # Store transition (individual states, actions, rewards, next_states, global states)
+        transition = {
+            "states": states,
+            "actions": actions,
+            "rewards": rewards,
+            "next_states": next_states,
+            "global_state": global_state,
+            "global_next_state": global_next_state,
+            "done": done
+        }
+        self.buffer.push(transition, actions[0], sum(rewards), global_next_state, done)
+        
+        # Track per-agent rewards
+        for i, agent in enumerate(self.agents):
+            agent.total_reward += rewards[i]
+        
+        self.timestep += 1
+        
+        # Learn periodically
+        if len(self.buffer) >= self.batch_size and self.timestep % self.update_every == 0:
+            self._learn()
+        
+        if done:
+            for agent in self.agents:
+                agent.decay_epsilon()
+            # Sync epsilon across agents
+            avg_eps = np.mean([a.epsilon for a in self.agents])
+            for agent in self.agents:
+                agent.epsilon = avg_eps
+
+    def _learn(self):
+        """QMIX learning step."""
+        # Sample batch
+        batch = self._sample_batch()
+        if batch is None:
+            return
+        
+        states_batch, actions_batch, rewards_batch, next_states_batch, dones_batch = batch
+        
+        batch_size = len(states_batch)
+        
+        # Process each sample
+        total_loss = 0
+        
+        for i in range(batch_size):
+            states = states_batch[i]
+            actions = actions_batch[i]
+            rewards = rewards_batch[i]
+            next_states = next_states_batch[i]
+            done = dones_batch[i]
+            
+            # Global states
+            global_state = torch.FloatTensor(self._build_global_state(states)).unsqueeze(0)
+            global_next_state = torch.FloatTensor(self._build_global_state(next_states)).unsqueeze(0)
+            
+            # Individual Q-values for current actions
+            individual_q = []
+            for j, agent in enumerate(self.agents):
+                state_t = torch.FloatTensor(np.array(states[j], dtype=np.float32)).unsqueeze(0)
+                q_values = agent.q_network(state_t)
+                individual_q.append(q_values[0, actions[j]])
+            individual_q = torch.stack(individual_q).unsqueeze(0)  # (1, n_agents)
+            
+            # Mixed current Q
+            current_q = self.mixing_network(individual_q, global_state)  # (1, 1)
+            
+            # Target Q: max Q for next state
+            with torch.no_grad():
+                next_individual_q = []
+                for j, agent in enumerate(self.agents):
+                    next_state_t = torch.FloatTensor(np.array(next_states[j], dtype=np.float32)).unsqueeze(0)
+                    next_q_values = agent.target_network(next_state_t)
+                    next_individual_q.append(torch.max(next_q_values, dim=1)[0].squeeze())
+                next_individual_q = torch.stack(next_individual_q).unsqueeze(0)  # (1, n_agents)
+                
+                next_q = self.target_mixing_network(next_individual_q, global_next_state)  # (1, 1)
+                
+                # Target = reward + gamma * next_q * (1 - done)
+                reward_sum = torch.FloatTensor([sum(rewards)]).unsqueeze(1)  # (1, 1)
+                done_t = torch.FloatTensor([done]).unsqueeze(1)  # (1, 1)
+                target_q = reward_sum + self.gamma * next_q * (1 - done_t)
+            
+            # Compute loss
+            loss = nn.MSELoss()(current_q, target_q)
+            total_loss += loss
+        
+        # Average loss and backprop
+        avg_loss = total_loss / batch_size
+        
+        # Update all agent networks
+        for agent in self.agents:
+            agent.optimizer.zero_grad()
+        self.mixing_optimizer.zero_grad()
+        
+        avg_loss.backward()
+        
+        for agent in self.agents:
+            agent.optimizer.step()
+        self.mixing_optimizer.step()
+        
+        # Soft update target networks
+        for agent in self.agents:
+            agent.soft_update_target()
+        
+        # Soft update target mixing network
+        for target_param, param in zip(self.target_mixing_network.parameters(), self.mixing_network.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+
+    def _sample_batch(self):
+        """Sample a batch from buffer."""
+        if len(self.buffer) < self.batch_size:
+            return None
+        
+        idx = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        batch = [self.buffer.buffer[i] for i in idx]
+        
+        # Extract components
+        states_batch = [b[0]["states"] for b in batch]
+        actions_batch = [b[0]["actions"] for b in batch]
+        rewards_batch = [b[0]["rewards"] for b in batch]
+        next_states_batch = [b[0]["next_states"] for b in batch]
+        dones_batch = [b[0]["done"] for b in batch]
+        
+        return states_batch, actions_batch, rewards_batch, next_states_batch, dones_batch
+
+    def compute_rewards(self,
+                        old_positions: List[Tuple[int, int]],
+                        new_positions: List[Tuple[int, int]],
+                        pacman_pos: Tuple[int, int],
+                        collision: bool,
+                        pellets_done: bool,
+                        valid_moves: List[bool]) -> List[float]:
+        rewards = []
+        for i, (old_pos, new_pos, valid) in enumerate(zip(old_positions, new_positions, valid_moves)):
+            helper = self.reward_helpers[i]
+            r = helper.compute_reward(old_pos, new_pos, pacman_pos, collision, pellets_done, valid)
+            rewards.append(r)
+
+        if collision and self.shared_collision:
+            for i in range(len(rewards)):
+                rewards[i] = max(rewards[i], REWARD_COLLISION)
+
+        return rewards
+
+    def reset_all(self):
+        for helper in self.reward_helpers:
+            helper.reset_episode()
+        for agent in self.agents:
+            agent.reset_episode()
+
+    def get_epsilon(self) -> float:
+        if not self.agents:
+            return 0.0
+        return float(np.mean([agent.epsilon for agent in self.agents]))
+
+    def save_all(self, directory: str):
+        os.makedirs(directory, exist_ok=True)
+        # Save each agent's Q-network
+        for i, agent in enumerate(self.agents):
+            torch.save(agent.q_network.state_dict(), 
+                      os.path.join(directory, f"ghost_{i}_qmix_q.pt"))
+        # Save mixing network
+        torch.save({
+            "mixing": self.mixing_network.state_dict(),
+            "target_mixing": self.target_mixing_network.state_dict(),
+        }, os.path.join(directory, "qmix_mixing.pt"))
+
+    def load_all(self, directory: str):
+        for i, agent in enumerate(self.agents):
+            path = os.path.join(directory, f"ghost_{i}_qmix_q.pt")
+            if os.path.exists(path):
+                agent.q_network.load_state_dict(torch.load(path))
+                agent.target_network.load_state_dict(torch.load(path))
+        
+        mixing_path = os.path.join(directory, "qmix_mixing.pt")
+        if os.path.exists(mixing_path):
+            payload = torch.load(mixing_path)
+            if isinstance(payload, dict):
+                self.mixing_network.load_state_dict(payload.get("mixing", payload))
+                self.target_mixing_network.load_state_dict(
+                    payload.get("target_mixing", payload.get("mixing", payload)))
+            else:
+                self.mixing_network.load_state_dict(payload)
+                self.target_mixing_network.load_state_dict(payload)

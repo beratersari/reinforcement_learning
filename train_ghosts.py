@@ -42,7 +42,7 @@ from pacman_game import (
     bfs_path, manhattan_distance
 )
 from ghost_rl import (
-    MultiGhostQLearning, MultiGhostMADDPG, MultiGhostDQN, QLearningGhost,
+    MultiGhostQLearning, MultiGhostMADDPG, MultiGhostDQN, MultiGhostQMIX, QLearningGhost,
     encode_state, execute_action,
     ACTION_UP, ACTION_DOWN, ACTION_LEFT, ACTION_RIGHT, ACTIONS
 )
@@ -114,6 +114,19 @@ def load_config(config_path: str = None) -> dict:
             "epsilon_decay": 0.995,
             "hidden_sizes": [128, 128],
         },
+        "qmix": {
+            "lr": 0.0005,
+            "gamma": 0.95,
+            "batch_size": 128,
+            "buffer_size": 100000,
+            "update_every": 4,
+            "tau": 0.005,
+            "epsilon_start": 1.0,
+            "epsilon_min": 0.05,
+            "epsilon_decay": 0.995,
+            "hidden_sizes": [128, 128],
+            "mixing_hidden": 64,
+        },
         "rewards": {
             "collision": 100,
             "pellets_done": -100,
@@ -129,6 +142,10 @@ def load_config(config_path: str = None) -> dict:
         "state": {
             "dist_bins": [0, 2, 4, 8, 16, 30],
             "grid_size": 30,
+        },
+        "observation": {
+            "range": 30,
+            "shared_pacman": False,
         },
         "training": {
             "max_steps_per_episode": 500,
@@ -156,7 +173,7 @@ def load_config(config_path: str = None) -> dict:
                 user_config = json.load(f)
             
             # Deep merge user config into defaults
-            for section in ["q_learning", "maddpg", "dqn", "rewards", "repeat_detection", "state", "training", "coordination", "team_rewards"]:
+            for section in ["q_learning", "maddpg", "dqn", "qmix", "rewards", "repeat_detection", "state", "observation", "training", "coordination", "team_rewards"]:
                 if section in user_config:
                     config[section].update(user_config[section])
             
@@ -227,6 +244,18 @@ def log_config(config: dict, train_map: int, test_map: int,
     logger.info(f"[DQN] Epsilon: start={dqn.get('epsilon_start', 1.0)}, min={dqn.get('epsilon_min', 0.05)}, decay={dqn.get('epsilon_decay', 0.995)}")
     logger.info(f"[DQN] Hidden Sizes: {dqn.get('hidden_sizes', [128, 128])}")
 
+    # QMIX hyperparameters
+    qmix = config.get("qmix", {})
+    logger.info(f"[QMIX] LR: {qmix.get('lr', 0.0005)}")
+    logger.info(f"[QMIX] Gamma: {qmix.get('gamma', 0.95)}")
+    logger.info(f"[QMIX] Batch Size: {qmix.get('batch_size', 128)}")
+    logger.info(f"[QMIX] Buffer Size: {qmix.get('buffer_size', 100000)}")
+    logger.info(f"[QMIX] Update Every: {qmix.get('update_every', 4)}")
+    logger.info(f"[QMIX] Tau: {qmix.get('tau', 0.005)}")
+    logger.info(f"[QMIX] Epsilon: start={qmix.get('epsilon_start', 1.0)}, min={qmix.get('epsilon_min', 0.05)}, decay={qmix.get('epsilon_decay', 0.995)}")
+    logger.info(f"[QMIX] Hidden Sizes: {qmix.get('hidden_sizes', [128, 128])}")
+    logger.info(f"[QMIX] Mixing Hidden: {qmix.get('mixing_hidden', 64)}")
+
     
     # Rewards
     logger.info(f"[REWARD] Collision: {rw.get('collision', 100)}")
@@ -242,6 +271,11 @@ def log_config(config: dict, train_map: int, test_map: int,
     # State space
     logger.info(f"[STATE] Dist Bins: {st.get('dist_bins', [0,2,4,8,16,30])}")
     logger.info(f"[STATE] Grid Size: {st.get('grid_size', 30)}")
+    
+    # Observation / partial observability
+    obs = config.get("observation", {})
+    logger.info(f"[OBS] Range: {obs.get('range', 30)} (full obs if >= grid size)")
+    logger.info(f"[OBS] Shared Pac-Man: {obs.get('shared_pacman', True)}")
     
     # Coordination / communication
     logger.info(f"[COORD] Enabled: {coord.get('enabled', True)}")
@@ -305,7 +339,7 @@ class RLTrainingEnvironment:
         
         # Model type from CLI arg (not config)
         self.model_type = model_type.lower()
-        if self.model_type not in ("qlearning", "maddpg", "dqn"):
+        if self.model_type not in ("qlearning", "maddpg", "dqn", "qmix"):
             logger.warning(f"Unknown model type '{model_type}', defaulting to qlearning")
             self.model_type = "qlearning"
         logger.info(f"[INIT] Model type: {self.model_type}")
@@ -429,6 +463,19 @@ class RLTrainingEnvironment:
                 repeat_threshold=self.repeat_threshold,
                 repeat_penalty=self.repeat_penalty
             )
+        elif self.model_type == "qmix":
+            state_dim = len(encode_state((0, 0), (0, 0), [], set(), [], GRID_SIZE))
+            action_dim = len(ACTIONS) + (1 if self.use_noop else 0)
+            
+            self.agents = MultiGhostQMIX(
+                num_ghosts=num_ghosts,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                config=config,
+                repeat_window=self.repeat_window,
+                repeat_threshold=self.repeat_threshold,
+                repeat_penalty=self.repeat_penalty
+            )
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         
@@ -501,17 +548,41 @@ class RLTrainingEnvironment:
         return self._get_states()
     
     def _get_states(self):
-        """Get current states for all ghosts."""
+        """Get current states for all ghosts with optional partial observability."""
+        obs_cfg = self.config.get("observation", {})
+        obs_range = obs_cfg.get("range", 30)
+        shared_pacman = obs_cfg.get("shared_pacman", True)
+        
+        # Full observability if range >= grid_size
+        if obs_range >= GRID_SIZE:
+            obs_range = None
+        
+        # Check shared visibility: does ANY ghost see PM within range?
+        team_sees_pm = False
+        if shared_pacman and obs_range is not None:
+            for ghost in self.game.ghosts:
+                if manhattan_distance(ghost.pos, self.game.pacman.pos) <= obs_range:
+                    team_sees_pm = True
+                    break
+        
         states = []
         for i, ghost in enumerate(self.game.ghosts):
             other_ghosts = [g.pos for j, g in enumerate(self.game.ghosts) if j != i]
+            # Shared mode: if team sees PM, all get full obs; else all unknown
+            # Individual mode: each ghost's own range
+            if shared_pacman:
+                effective_range = None if team_sees_pm else obs_range
+            else:
+                effective_range = obs_range
+            
             state = encode_state(
                 ghost.pos,
                 self.game.pacman.pos,
                 other_ghosts,
                 self.game.walls,
                 self.game.pellets,
-                GRID_SIZE
+                GRID_SIZE,
+                observation_range=effective_range
             )
             states.append(state)
         return states
@@ -529,6 +600,9 @@ class RLTrainingEnvironment:
         Strategy: Each ghost approaches from a fixed cardinal direction around PM.
         For 4 ghosts: N/E/S/W at shrinking radius. For 2: left/right.
         Radius adapts to avg ghost distance. When close, direct chase kicks in.
+        
+        Respects partial observability: if no ghost can see PM (within observation range),
+        skips coordination and returns base RL actions.
         """
         if not self.coordination_enabled:
             return base_actions
@@ -537,6 +611,17 @@ class RLTrainingEnvironment:
         ghosts = self.game.ghosts
         walls = self.game.walls
         num = len(ghosts)
+        
+        # Partial observability: check if ANY ghost can see PM within observation range
+        obs_cfg = self.config.get("observation", {})
+        obs_range = obs_cfg.get("range", 30)
+        if obs_range < GRID_SIZE:
+            can_see_pm = any(
+                manhattan_distance(g.pos, pm) <= obs_range for g in ghosts
+            )
+            if not can_see_pm:
+                # No ghost sees PM - skip coordination, use base RL actions
+                return base_actions
         
         if num == 0:
             return base_actions
@@ -1359,6 +1444,54 @@ class RLTrainingEnvironment:
         print(f"\n{'='*70}")
         print("TRAINING COMPLETE")
         print(f"{'='*70}\n")
+        
+        # Export results to CSV
+        self._save_results_csv(total_episodes)
+
+    def _save_results_csv(self, total_episodes: int):
+        """Save training results to CSV file with model name, ghost count, and date."""
+        from datetime import datetime
+        import csv
+        
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model = getattr(self, 'model_type', 'unknown')
+        ghosts = self.num_ghosts
+        
+        filename = f"results_{model}_{ghosts}ghosts_{date_str}.csv"
+        
+        # Calculate stats
+        avg_reward = np.mean(self.episode_rewards_history) if self.episode_rewards_history else 0
+        final_100_avg = np.mean(self.episode_rewards_history[-100:]) if len(self.episode_rewards_history) >= 100 else avg_reward
+        ghost_win_rate = self.wins_ghosts / max(total_episodes, 1)
+        pm_win_rate = self.wins_pacman / max(total_episodes, 1)
+        avg_steps = np.mean(self.episode_lengths) if self.episode_lengths else 0
+        
+        obs_cfg = self.config.get("observation", {})
+        obs_range = obs_cfg.get("range", 30)
+        shared_pm = obs_cfg.get("shared_pacman", False)
+        
+        row = {
+            "date": datetime.now().isoformat(),
+            "model": model,
+            "ghosts": ghosts,
+            "episodes": total_episodes,
+            "ghost_win_rate": round(ghost_win_rate, 4),
+            "pacman_win_rate": round(pm_win_rate, 4),
+            "avg_reward": round(avg_reward, 2),
+            "final_100_avg_reward": round(final_100_avg, 2),
+            "avg_episode_steps": round(avg_steps, 2),
+            "obs_range": obs_range,
+            "shared_pacman": shared_pm,
+            "train_map": getattr(self, 'train_map', 0),
+            "test_map": getattr(self, 'test_map', 0),
+        }
+        
+        with open(filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=row.keys())
+            writer.writeheader()
+            writer.writerow(row)
+        
+        logger.info(f"[CSV] Results saved to: {filename}")
 
 
 def main():
@@ -1421,8 +1554,8 @@ Examples:
     parser.add_argument("--config", type=str, default="config.json",
                         help="[TRAIN] Path to config.json for hyperparameters (default: config.json)")
     parser.add_argument("--model", type=str, default="qlearning",
-                        choices=["qlearning", "maddpg", "dqn"],
-                        help="[MODEL] Algorithm: qlearning, maddpg, or dqn (default: qlearning)")
+                        choices=["qlearning", "maddpg", "dqn", "qmix"],
+                        help="[MODEL] Algorithm: qlearning, maddpg, dqn, or qmix (default: qlearning)")
     parser.add_argument("--eval-only", action="store_true",
                         help="[TRAIN] Run evaluation only (requires --load-dir)")
     
