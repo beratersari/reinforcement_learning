@@ -222,4 +222,4 @@ To ensure robust behavior, the environment enforces:
 - `pacman_game.py`: Core game logic, map generation, and rendering.
 - `ghost_rl.py`: Agent implementations (DQN, MADDPG, Q-Learning).
 - `train_ghosts.py`: Training loop, environment wrapper, and CLI entry point.
-- `config.json`: Hyperparameters.
+- `config.json`: Hyperparameters. For all models
