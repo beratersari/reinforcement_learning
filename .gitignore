@@ -17,6 +17,7 @@ app.log
 # Training artifacts
 results_*.csv
 evaluation_moves.txt
+checkpoints
 checkpoints*/
 *.pt
 
