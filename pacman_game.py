@@ -1,6 +1,6 @@
 """
 Pac-Man Simulation Game for RL Training Prep
-Grid: 30x30
+Grid: configurable via config/game initialization
 - Pac-Man: Heuristic AI (collect pellets, escape ghosts)
 - Ghosts: Random movement (block each other)
 - No user control - pure simulation
@@ -251,11 +251,29 @@ class MapGenerator:
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-GRID_SIZE = 30
-CELL_SIZE = 25  # Slightly smaller to fit 30x30 on screen
-WINDOW_SIZE = GRID_SIZE * CELL_SIZE  # 750x750
+DEFAULT_GRID_SIZE = 30
+BASE_WINDOW_SIZE = 750
+MIN_CELL_SIZE = 8
+MAX_CELL_SIZE = 25
+
+GRID_SIZE = DEFAULT_GRID_SIZE
+CELL_SIZE = MAX_CELL_SIZE
+WINDOW_SIZE = GRID_SIZE * CELL_SIZE
 POPUP_WIDTH = 400
 POPUP_HEIGHT = 200
+
+
+def configure_grid(grid_size: int):
+    """Configure module-level grid metrics for training and rendering."""
+    global GRID_SIZE, CELL_SIZE, WINDOW_SIZE
+
+    grid_size = int(grid_size)
+    if grid_size < 10:
+        raise ValueError("grid_size must be at least 10")
+
+    GRID_SIZE = grid_size
+    CELL_SIZE = max(MIN_CELL_SIZE, min(MAX_CELL_SIZE, BASE_WINDOW_SIZE // GRID_SIZE))
+    WINDOW_SIZE = GRID_SIZE * CELL_SIZE
 
 # Colors
 BLACK = (0, 0, 0)
@@ -291,11 +309,13 @@ def manhattan_distance(pos1: Tuple[int, int], pos2: Tuple[int, int]) -> int:
     return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
 
 
-def is_valid_position(pos: Tuple[int, int], walls: Set[Tuple[int, int]]) -> bool:
+def is_valid_position(pos: Tuple[int, int], walls: Set[Tuple[int, int]], grid_size: int = None) -> bool:
     """Check if position is valid (in grid and not a wall)."""
     x, y = pos
-    return (0 <= x < GRID_SIZE and 
-            0 <= y < GRID_SIZE and 
+    if grid_size is None:
+        grid_size = GRID_SIZE
+    return (0 <= x < grid_size and 
+            0 <= y < grid_size and 
             pos not in walls)
 
 
@@ -384,11 +404,12 @@ class Ghost:
     
     COLORS = [RED, CYAN, ORANGE, PINK]
     
-    def __init__(self, pos: Tuple[int, int], ghost_id: int, walls: Set[Tuple[int, int]]):
+    def __init__(self, pos: Tuple[int, int], ghost_id: int, walls: Set[Tuple[int, int]], grid_size: int = None):
         self.pos = pos
         self.id = ghost_id
         self.color = self.COLORS[ghost_id % len(self.COLORS)]
         self.walls = walls
+        self.grid_size = grid_size if grid_size is not None else GRID_SIZE
         self.direction = random.choice(DIRECTIONS)
         self.move_cooldown = 0
     
@@ -402,14 +423,14 @@ class Ghost:
         new_pos = (self.pos[0] + self.direction[0], 
                    self.pos[1] + self.direction[1])
         
-        if is_valid_position(new_pos, self.walls) and new_pos not in other_ghost_positions:
+        if is_valid_position(new_pos, self.walls, self.grid_size) and new_pos not in other_ghost_positions:
             self.pos = new_pos
         else:
             # Hit wall or other ghost, pick new random direction
             valid_directions = []
             for dx, dy in DIRECTIONS:
                 test_pos = (self.pos[0] + dx, self.pos[1] + dy)
-                if is_valid_position(test_pos, self.walls) and test_pos not in other_ghost_positions:
+                if is_valid_position(test_pos, self.walls, self.grid_size) and test_pos not in other_ghost_positions:
                     valid_directions.append((dx, dy))
             
             if valid_directions:
@@ -448,9 +469,10 @@ class Ghost:
 class PacMan:
     """Pac-Man character with heuristic AI."""
     
-    def __init__(self, pos: Tuple[int, int], walls: Set[Tuple[int, int]]):
+    def __init__(self, pos: Tuple[int, int], walls: Set[Tuple[int, int]], grid_size: int = None):
         self.pos = pos
         self.walls = walls
+        self.grid_size = grid_size if grid_size is not None else GRID_SIZE
         self.score = 0
         self.pellets_collected = 0
     
@@ -492,7 +514,7 @@ class PacMan:
             if escape_dir:
                 new_pos = (self.pos[0] + escape_dir[0], 
                            self.pos[1] + escape_dir[1])
-                if is_valid_position(new_pos, self.walls):
+                if is_valid_position(new_pos, self.walls, self.grid_size):
                     return new_pos
         
         # Priority 2: Escape mode
@@ -501,7 +523,7 @@ class PacMan:
             if escape_dir:
                 new_pos = (self.pos[0] + escape_dir[0], 
                            self.pos[1] + escape_dir[1])
-                if is_valid_position(new_pos, self.walls):
+                if is_valid_position(new_pos, self.walls, self.grid_size):
                     return new_pos
         
         # Priority 3: Collect pellets
@@ -515,7 +537,7 @@ class PacMan:
         valid_moves = []
         for dx, dy in DIRECTIONS:
             new_pos = (self.pos[0] + dx, self.pos[1] + dy)
-            if is_valid_position(new_pos, self.walls):
+            if is_valid_position(new_pos, self.walls, self.grid_size):
                 valid_moves.append(new_pos)
         
         if valid_moves:
@@ -557,9 +579,14 @@ class PacMan:
 class PacManGame:
     """Main game class managing all game state."""
     
-    def __init__(self, max_pellets: int = None, time_limit: float = None):
+    def __init__(self, max_pellets: int = None, time_limit: float = None, grid_size: int = None):
+        self.grid_size = int(grid_size) if grid_size is not None else GRID_SIZE
+        configure_grid(self.grid_size)
+        self.cell_size = CELL_SIZE
+        self.window_size = WINDOW_SIZE
+
         pygame.init()
-        self.screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE + 40))
+        self.screen = pygame.display.set_mode((self.window_size, self.window_size + 40))
         pygame.display.set_caption("Pac-Man RL Training Simulation")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
@@ -594,9 +621,9 @@ class PacManGame:
         print("Generating maps...")
         # Mix of map types
         generators = [
-            ("Random", lambda s: MapGenerator.generate_random_maze(GRID_SIZE, 0.12, s)),
-            ("Maze", lambda s: MapGenerator.generate_maze_recursive(GRID_SIZE, s)),
-            ("Classic", lambda s: MapGenerator.generate_classic_style(GRID_SIZE, s)),
+            ("Random", lambda s: MapGenerator.generate_random_maze(self.grid_size, 0.12, s)),
+            ("Maze", lambda s: MapGenerator.generate_maze_recursive(self.grid_size, s)),
+            ("Classic", lambda s: MapGenerator.generate_classic_style(self.grid_size, s)),
         ]
         
         for i in range(num_maps):
@@ -622,12 +649,12 @@ class PacManGame:
         
         # Title
         title = self.title_font.render("PAC-MAN RL SIMULATION", True, YELLOW)
-        title_rect = title.get_rect(center=(WINDOW_SIZE // 2, 80))
+        title_rect = title.get_rect(center=(self.window_size // 2, 80))
         self.screen.blit(title, title_rect)
         
         # Subtitle
         sub = self.font.render("Select a Map:", True, WHITE)
-        sub_rect = sub.get_rect(center=(WINDOW_SIZE // 2, 140))
+        sub_rect = sub.get_rect(center=(self.window_size // 2, 140))
         self.screen.blit(sub, sub_rect)
         
         # Map list
@@ -641,7 +668,7 @@ class PacManGame:
         
         # Instructions
         instr = self.font.render("Press 1-9 to select | ENTER to start | ESC to quit", True, GRAY)
-        instr_rect = instr.get_rect(center=(WINDOW_SIZE // 2, WINDOW_SIZE + 10))
+        instr_rect = instr.get_rect(center=(self.window_size // 2, self.window_size + 10))
         self.screen.blit(instr, instr_rect)
         
         pygame.display.flip()
@@ -651,11 +678,11 @@ class PacManGame:
         walls = set()
         
         # Add border walls only - simple open field with scatter obstacles
-        for i in range(GRID_SIZE):
+        for i in range(self.grid_size):
             walls.add((i, 0))
-            walls.add((i, GRID_SIZE - 1))
+            walls.add((i, self.grid_size - 1))
             walls.add((0, i))
-            walls.add((GRID_SIZE - 1, i))
+            walls.add((self.grid_size - 1, i))
         
         # Simple, guaranteed-open obstacles (no enclosed rooms possible)
         # Just scattered short lines and small L-shapes that can't close
@@ -732,8 +759,8 @@ class PacManGame:
         
         # First, find all reachable cells (BFS from center-ish starting point)
         start = None
-        for x in range(1, GRID_SIZE - 1):
-            for y in range(1, GRID_SIZE - 1):
+        for x in range(1, self.grid_size - 1):
+            for y in range(1, self.grid_size - 1):
                 if (x, y) not in self.walls:
                     start = (x, y)
                     break
@@ -751,7 +778,7 @@ class PacManGame:
             cx, cy = queue.popleft()
             for dx, dy in DIRECTIONS:
                 nx, ny = cx + dx, cy + dy
-                if (0 < nx < GRID_SIZE - 1 and 0 < ny < GRID_SIZE - 1 and
+                if (0 < nx < self.grid_size - 1 and 0 < ny < self.grid_size - 1 and
                     (nx, ny) not in self.walls and (nx, ny) not in reachable):
                     reachable.add((nx, ny))
                     queue.append((nx, ny))
@@ -779,20 +806,25 @@ class PacManGame:
         # Find valid spawn positions
         valid_positions = [
             (x, y) 
-            for x in range(1, GRID_SIZE - 1) 
-            for y in range(1, GRID_SIZE - 1)
+            for x in range(1, self.grid_size - 1) 
+            for y in range(1, self.grid_size - 1)
             if (x, y) not in self.walls
         ]
         
         if not valid_positions:
             print("ERROR: No valid positions! Regenerating map...")
-            self.maps[self.current_map_idx] = MapGenerator.generate_random_maze(GRID_SIZE, 0.1)
+            self.maps[self.current_map_idx] = MapGenerator.generate_random_maze(self.grid_size, 0.1)
             self._load_map(self.current_map_idx)
-            valid_positions = [(x, y) for x in range(1, GRID_SIZE-1) for y in range(1, GRID_SIZE-1) if (x,y) not in self.walls]
+            valid_positions = [
+                (x, y)
+                for x in range(1, self.grid_size - 1)
+                for y in range(1, self.grid_size - 1)
+                if (x, y) not in self.walls
+            ]
         
         # Spawn Pac-Man
         pacman_spawn = random.choice(valid_positions)
-        self.pacman = PacMan(pacman_spawn, self.walls)
+        self.pacman = PacMan(pacman_spawn, self.walls, self.grid_size)
         
         # Spawn ghosts
         self.ghosts = []
@@ -800,7 +832,7 @@ class PacManGame:
         if num_ghosts > 0:
             ghost_spawns = random.sample(valid_positions, num_ghosts)
             for i, pos in enumerate(ghost_spawns):
-                self.ghosts.append(Ghost(pos, i, self.walls))
+                self.ghosts.append(Ghost(pos, i, self.walls, self.grid_size))
         
         # Generate pellets (only on reachable cells, up to max_pellets)
         self.pellets = self._generate_pellets()
@@ -868,10 +900,10 @@ class PacManGame:
     
     def draw_grid(self):
         """Draw the grid background."""
-        for x in range(GRID_SIZE):
-            for y in range(GRID_SIZE):
-                rect = pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, 
-                                  CELL_SIZE, CELL_SIZE)
+        for x in range(self.grid_size):
+            for y in range(self.grid_size):
+                rect = pygame.Rect(x * self.cell_size, y * self.cell_size, 
+                                  self.cell_size, self.cell_size)
                 
                 if (x, y) in self.walls:
                     pygame.draw.rect(self.screen, GRAY, rect)
@@ -884,8 +916,8 @@ class PacManGame:
         """Draw all active pellets."""
         for pellet in self.pellets:
             if pellet.active:
-                center_x = pellet.pos[0] * CELL_SIZE + CELL_SIZE // 2
-                center_y = pellet.pos[1] * CELL_SIZE + CELL_SIZE // 2
+                center_x = pellet.pos[0] * self.cell_size + self.cell_size // 2
+                center_y = pellet.pos[1] * self.cell_size + self.cell_size // 2
                 pygame.draw.circle(self.screen, PELLET_COLOR, 
                                   (center_x, center_y), 4)
     
@@ -920,27 +952,27 @@ class PacManGame:
         # Map name (left)
         map_name = self.maps[self.current_map_idx]["display_name"] if self.maps else "Unknown"
         map_text = self.font.render(f"Map: {map_name}", True, CYAN)
-        self.screen.blit(map_text, (10, WINDOW_SIZE + 10))
+        self.screen.blit(map_text, (10, self.window_size + 10))
         
         # Timer (center-left) - show countdown (compute fresh from start_time)
         current_elapsed = (pygame.time.get_ticks() - self.start_time) / 1000.0 if self.start_time else 0
         remaining = max(0, self.time_limit - current_elapsed)
         timer_color = RED if remaining < 5 else YELLOW if remaining < 10 else WHITE
         timer_text = self.font.render(f"⏱ {remaining:.1f}s", True, timer_color)
-        self.screen.blit(timer_text, (WINDOW_SIZE // 4, WINDOW_SIZE + 10))
+        self.screen.blit(timer_text, (self.window_size // 4, self.window_size + 10))
         
         # Score (center)
         score_text = self.font.render(
             f"Score: {self.pacman.score} | Pellets: {self.pacman.pellets_collected}/{len(self.pellets)}", 
             True, WHITE)
-        score_rect = score_text.get_rect(center=(WINDOW_SIZE // 2, WINDOW_SIZE + 20))
+        score_rect = score_text.get_rect(center=(self.window_size // 2, self.window_size + 20))
         self.screen.blit(score_text, score_rect)
         
         # Ghost danger indicator (right)
         nearby = self.pacman.get_nearby_ghosts(self.ghosts, GHOST_ESCAPE_DISTANCE)
         if nearby:
             danger = self.font.render(f"⚠ {len(nearby)} ghost(s)!", True, RED)
-            self.screen.blit(danger, (WINDOW_SIZE - 120, WINDOW_SIZE + 10))
+            self.screen.blit(danger, (self.window_size - 120, self.window_size + 10))
     
     def _draw_popup(self):
         """Draw WIN or LOSE popup overlay."""
@@ -948,14 +980,14 @@ class PacManGame:
             return
         
         # Semi-transparent overlay
-        overlay = pygame.Surface((WINDOW_SIZE, WINDOW_SIZE + 40))
+        overlay = pygame.Surface((self.window_size, self.window_size + 40))
         overlay.set_alpha(180)
         overlay.fill(BLACK)
         self.screen.blit(overlay, (0, 0))
         
         # Popup box
-        popup_x = (WINDOW_SIZE - POPUP_WIDTH) // 2
-        popup_y = (WINDOW_SIZE - POPUP_HEIGHT) // 2
+        popup_x = (self.window_size - POPUP_WIDTH) // 2
+        popup_y = (self.window_size - POPUP_HEIGHT) // 2
         popup_rect = pygame.Rect(popup_x, popup_y, POPUP_WIDTH, POPUP_HEIGHT)
         
         # Draw popup background
@@ -980,26 +1012,26 @@ class PacManGame:
         # Render title
         title_font = pygame.font.Font(None, 48)
         title_surface = title_font.render(title_text, True, title_color)
-        title_rect = title_surface.get_rect(center=(WINDOW_SIZE // 2, popup_y + 60))
+        title_rect = title_surface.get_rect(center=(self.window_size // 2, popup_y + 60))
         self.screen.blit(title_surface, title_rect)
         
         # Render message
         msg_font = pygame.font.Font(None, 32)
         msg_surface = msg_font.render(message, True, BLACK)
-        msg_rect = msg_surface.get_rect(center=(WINDOW_SIZE // 2, popup_y + 110))
+        msg_rect = msg_surface.get_rect(center=(self.window_size // 2, popup_y + 110))
         self.screen.blit(msg_surface, msg_rect)
         
         # Render stats
         stats_font = pygame.font.Font(None, 24)
         stats_text = f"Score: {self.pacman.score} | Pellets: {self.pacman.pellets_collected}/{len(self.pellets)}"
         stats_surface = stats_font.render(stats_text, True, GRAY)
-        stats_rect = stats_surface.get_rect(center=(WINDOW_SIZE // 2, popup_y + 150))
+        stats_rect = stats_surface.get_rect(center=(self.window_size // 2, popup_y + 150))
         self.screen.blit(stats_surface, stats_rect)
         
         # Reset instruction
         reset_font = pygame.font.Font(None, 20)
         reset_surface = reset_font.render("R: Restart | N: Next Map | Auto in 5s...", True, GRAY)
-        reset_rect = reset_surface.get_rect(center=(WINDOW_SIZE // 2, popup_y + 175))
+        reset_rect = reset_surface.get_rect(center=(self.window_size // 2, popup_y + 175))
         self.screen.blit(reset_surface, reset_rect)
     
     def run(self):

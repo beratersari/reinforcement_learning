@@ -14,3 +14,9 @@ codeforces_clone.db
 app.log
 .DS_Store
 
+# Training artifacts
+results_*.csv
+evaluation_moves.txt
+checkpoints*/
+*.pt
+
