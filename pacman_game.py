@@ -403,6 +403,8 @@ class Ghost:
     """Ghost enemy that moves randomly."""
     
     COLORS = [RED, CYAN, ORANGE, PINK]
+    ROLE_LABELS = {0: "C", 1: "B", 2: "A"}  # Chaser, Blocker, Ambusher
+    ROLE_COLORS = {0: (255, 100, 100), 1: (100, 100, 255), 2: (100, 255, 100)}
     
     def __init__(self, pos: Tuple[int, int], ghost_id: int, walls: Set[Tuple[int, int]], grid_size: int = None):
         self.pos = pos
@@ -412,6 +414,7 @@ class Ghost:
         self.grid_size = grid_size if grid_size is not None else GRID_SIZE
         self.direction = random.choice(DIRECTIONS)
         self.move_cooldown = 0
+        self.role = None  # 0=Chaser, 1=Blocker, 2=Ambusher (set by RLTrainingEnvironment)
     
     def move(self, other_ghost_positions: Set[Tuple[int, int]]):
         """Move ghost randomly, blocking other ghosts."""
@@ -464,6 +467,15 @@ class Ghost:
         pygame.draw.circle(surface, BLACK, 
                           (center_x + eye_offset, center_y - eye_offset), 
                           radius // 8)
+        
+        # Role label (if role is set)
+        if self.role is not None and self.role in self.ROLE_LABELS:
+            font = pygame.font.Font(None, 24)
+            role_label = self.ROLE_LABELS[self.role]
+            role_color = self.ROLE_COLORS.get(self.role, WHITE)
+            text = font.render(role_label, True, role_color)
+            text_rect = text.get_rect(center=(center_x, center_y + radius + 8))
+            surface.blit(text, text_rect)
 
 
 class PacMan:

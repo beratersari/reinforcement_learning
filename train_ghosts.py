@@ -59,6 +59,9 @@ from models import (
     MultiGhostDQN,
     MultiGhostPPO,
     MultiGhostQMIX,
+    MultiGhostVDN,
+    GhostRole,
+    RoleManager,
 )
 
 import pygame
@@ -354,7 +357,8 @@ class RLTrainingEnvironment:
                  model_type: str = "qlearning", log_moves: bool = False,
                  train_random_map: bool = False,
                  train_maps: Optional[list] = None,
-                 train_grid_sizes: Optional[list] = None):
+                 train_grid_sizes: Optional[list] = None,
+                 use_roles: bool = False):
         """
         Initialize training environment.
         
@@ -366,11 +370,12 @@ class RLTrainingEnvironment:
             test_map: Map index for testing (defaults to train_map)
             config: Pre-loaded config dict (from load_config())
             config_path: Path to config.json (if config not provided)
-            model_type: 'qlearning', 'maddpg', 'dqn', 'ppo', or 'qmix'
+            model_type: 'qlearning', 'maddpg', 'dqn', 'ppo', 'qmix', or 'vdn'
             log_moves: Enable logging of moves to file
             train_random_map: If True, pick random training map each episode
             train_maps: Specific map indices to sample from each episode
             train_grid_sizes: Grid sizes to sample from each episode
+            use_roles: Enable ghost role system (Chaser/Blocker/Ambusher)
         """
         self.render_mode = render
         self.fps = fps
@@ -400,7 +405,7 @@ class RLTrainingEnvironment:
         
         # Model type from CLI arg (not config)
         self.model_type = model_type.lower()
-        if self.model_type not in ("qlearning", "maddpg", "dqn", "ppo", "qmix"):
+        if self.model_type not in ("qlearning", "maddpg", "dqn", "ppo", "qmix", "vdn"):
             logger.warning(f"Unknown model type '{model_type}', defaulting to qlearning")
             self.model_type = "qlearning"
         logger.info(f"[INIT] Model type: {self.model_type}")
@@ -581,8 +586,32 @@ class RLTrainingEnvironment:
                 repeat_threshold=self.repeat_threshold,
                 repeat_penalty=self.repeat_penalty
             )
+        elif self.model_type == "vdn":
+            state_dim = len(encode_state((0, 0), (0, 0), [], set(), [], self.grid_size))
+            action_dim = len(ACTIONS) + (1 if self.use_noop else 0)
+            
+            self.agents = MultiGhostVDN(
+                num_ghosts=num_ghosts,
+                state_dim=state_dim,
+                action_dim=action_dim,
+                config=config,
+                repeat_window=self.repeat_window,
+                repeat_threshold=self.repeat_threshold,
+                repeat_penalty=self.repeat_penalty
+            )
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
+        
+        # Role manager for multi-head policy (each ghost picks Chaser/Blocker/Ambusher)
+        # Only enabled if --use-roles flag is passed
+        self.use_roles = use_roles
+        if self.use_roles:
+            self.role_manager = RoleManager(num_ghosts=self.num_ghosts,
+                                            epsilon_start=self.epsilon,
+                                            epsilon_min=self.epsilon_min,
+                                            epsilon_decay=self.epsilon_decay)
+        else:
+            self.role_manager = None
         
         # Episode tracking (training)
         self.episode = 0
@@ -1103,6 +1132,7 @@ class RLTrainingEnvironment:
         
         # Render if enabled
         if self.render_mode:
+            self._update_ghost_roles()
             self.game.draw()
             self.clock.tick(self.fps)
             # Handle quit events
@@ -1226,8 +1256,16 @@ class RLTrainingEnvironment:
     def render(self):
         """Manually render current frame."""
         if self.render_mode:
+            self._update_ghost_roles()
             self.game.draw()
             self.clock.tick(self.fps)
+    
+    def _update_ghost_roles(self):
+        """Update ghost role attributes for visual display."""
+        if self.use_roles and self.role_manager:
+            for i, ghost in enumerate(self.game.ghosts):
+                if i < len(self.role_manager.roles):
+                    self.game.ghosts[i].role = self.role_manager.roles[i].value
     
     def train_episode(self, max_steps: int = None):
         """Run one training episode."""
@@ -1447,19 +1485,8 @@ class RLTrainingEnvironment:
                 avg_reward = np.mean(recent_rewards) if recent_rewards else 0.0
                 win_rate = self.wins_ghosts / (self.wins_ghosts + self.wins_pacman + 1) * 100
                 
-                # Build progress message based on model type
-                base_msg = f"[PROGRESS] Ep {ep+1:5d} | AvgR: {avg_reward:8.1f} | GhostWin: {win_rate:5.1f}%"
-                
-                # Check if model uses epsilon for exploration
-                if hasattr(self.agents, "uses_epsilon") and self.agents.uses_epsilon():
-                    epsilon_val = self.agents.get_epsilon()
-                    logger.info(f"{base_msg} | ε: {epsilon_val:.3f}")
-                elif self.model_type == "ppo" and hasattr(self.agents, "get_training_stats"):
-                    # Show PPO-specific stats
-                    stats = self.agents.get_training_stats()
-                    logger.info(f"{base_msg} | PLoss: {stats['policy_loss']:.3f} | VLoss: {stats['value_loss']:.3f} | Ent: {stats['entropy']:.3f}")
-                else:
-                    logger.info(base_msg)
+                # Uniform progress message for all model types
+                logger.info(f"[PROGRESS] Ep {ep+1:5d} | AvgR: {avg_reward:8.1f} | GhostWin: {win_rate:5.1f}%")
             
             # Save checkpoint
             if (ep + 1) % save_every == 0:
@@ -1652,6 +1679,18 @@ class RLTrainingEnvironment:
             print(f"└{'─'*70}┘")
         
         # =====================================================================
+        # GHOST ROLES (if role mode active)
+        # =====================================================================
+        if self.use_roles and self.role_manager:
+            print(f"\n┌─ GHOST ROLES {'─'*56}┐")
+            print(f"│  {'Ghost':<8} {'Role':<12} {'ε Role':>10} │")
+            print(f"│  {'─'*8} {'─'*12} {'─'*10} │")
+            for i, role in enumerate(self.role_manager.roles):
+                role_name = self.role_manager.get_role_name(role)
+                print(f"│  {i:<8} {role_name:<12} {self.role_manager.role_epsilon:>10.3f} │")
+            print(f"└{'─'*70}┘")
+        
+        # =====================================================================
         # MODEL FILES
         # =====================================================================
         print(f"\n┌─ SAVED MODEL FILES {'─'*49}┐")
@@ -1694,6 +1733,15 @@ class RLTrainingEnvironment:
         elif self.model_type == "qmix":
             filenames = ["qmix_mixing.pt"] + [f"ghost_{i}_qmix_q.pt" for i in range(self.num_ghosts)]
             for filename in filenames:
+                filepath = os.path.join(self.save_dir, filename)
+                if os.path.exists(filepath):
+                    size_kb = os.path.getsize(filepath) / 1024
+                    print(f"│  {filename:<30} ({size_kb:>6.1f} KB)                 │")
+                else:
+                    print(f"│  {filename:<30} (NOT FOUND)                        │")
+        elif self.model_type == "vdn":
+            for i in range(self.num_ghosts):
+                filename = f"ghost_{i}_vdn_q.pt"
                 filepath = os.path.join(self.save_dir, filename)
                 if os.path.exists(filepath):
                     size_kb = os.path.getsize(filepath) / 1024
@@ -1854,10 +1902,12 @@ Examples:
     parser.add_argument("--config", type=str, default="config.json",
                         help="[TRAIN] Path to config.json for hyperparameters (default: config.json)")
     parser.add_argument("--model", type=str, default="qlearning",
-                        choices=["qlearning", "maddpg", "dqn", "ppo", "qmix"],
-                        help="[MODEL] Algorithm: qlearning, maddpg, dqn, ppo, or qmix (default: qlearning)")
+                        choices=["qlearning", "maddpg", "dqn", "ppo", "qmix", "vdn"],
+                        help="[MODEL] Algorithm: qlearning, maddpg, dqn, ppo, qmix, or vdn (default: qlearning)")
     parser.add_argument("--eval-only", action="store_true",
                         help="[TRAIN] Run evaluation only (requires --load-dir)")
+    parser.add_argument("--use-roles", action="store_true",
+                        help="[TRAIN] Enable ghost role system (Chaser/Blocker/Ambusher)")
     
     # ========================================================================
     # RENDERING OPTIONS (CLI)
@@ -1941,6 +1991,7 @@ Examples:
         train_random_map=args.train_random_map,
         train_maps=parsed_train_maps,
         train_grid_sizes=parsed_train_grid_sizes,
+        use_roles=args.use_roles,
     )
     
     # Log full config after init

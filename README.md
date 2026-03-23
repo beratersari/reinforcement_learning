@@ -1,6 +1,6 @@
 # Pac-Man RL Simulation (Multi-Agent)
 
-A customizable Pac-Man simulation environment with a configurable grid size (default 30x30) for training and evaluating multi-agent Reinforcement Learning (RL) models. This project supports **Q-Learning**, **MADDPG**, **Shared DQN**, **PPO** (On-Policy Policy Gradient), and **QMIX** (Factorized Q-Learning) agents controlling the ghosts to capture Pac-Man.
+A customizable Pac-Man simulation environment with a configurable grid size (default 30x30) for training and evaluating multi-agent Reinforcement Learning (RL) models. This project supports **Q-Learning**, **MADDPG**, **Shared DQN**, **PPO** (On-Policy Policy Gradient), **QMIX** (Factorized Q-Learning), and **VDN** (Value Decomposition Networks) agents controlling the ghosts to capture Pac-Man.
 
 ## Features
 
@@ -11,11 +11,14 @@ A customizable Pac-Man simulation environment with a configurable grid size (def
   - **Shared DQN**: Deep Q-Network with shared weights and replay buffer, using ghost IDs for role differentiation.
   - **PPO**: Shared actor-critic policy trained on-policy with clipped policy updates and generalized advantage estimation.
   - **QMIX**: Factorized Multi-Agent Q-Learning with centralized training and decentralized execution. Uses a mixing network to combine individual Q-values into joint Q-value.
+  - **VDN**: Value Decomposition Networks - simpler factorization where Q_total = sum of individual Q-values.
 - **Coordination**: Built-in mechanisms for encirclement and trapping strategies.
 - **Reward Shaping**: Team-based rewards to encourage spacing, mobility reduction, and discourage clustering/line formations.
 - **Anti-Pattern Logic**: Hard overrides to prevent infinite loops (oscillations) and ghost-on-ghost collisions.
 - **Maps**: 6 procedural and classic map layouts.
 - **Logging**: Detailed move logging for behavior analysis.
+- **Ghost Roles**: Optional role-based multi-head policy with Chaser, Blocker, and Ambusher roles.
+- **Model Comparison**: Compare all models with a single command via `compare_models.py`.
 
 ---
 
@@ -82,6 +85,16 @@ Train **QMIX** on random maps:
 python train_ghosts.py --episodes 1000 --model qmix --train-random-map --save-dir checkpoints_qmix_random/
 ```
 
+Train **VDN** (single map):
+```bash
+python train_ghosts.py --episodes 1000 --model vdn --save-dir checkpoints_vdn/
+```
+
+Train **VDN** on random maps:
+```bash
+python train_ghosts.py --episodes 1000 --model vdn --train-random-map --save-dir checkpoints_vdn_random/
+```
+
 ### 3. Evaluate and Watch
 Watch the trained agents play (no training):
 ```bash
@@ -115,10 +128,129 @@ Evaluate **QMIX**:
 python train_ghosts.py --episodes 50 --model qmix --load-dir checkpoints_qmix/ --eval-only --render --fps 15
 ```
 
+Evaluate **VDN**:
+```bash
+python train_ghosts.py --episodes 50 --model vdn --load-dir checkpoints_vdn/ --eval-only --render --fps 15
+```
+
+### Ghost Roles (--use-roles)
+
+Enable the role-based multi-head policy system with `--use-roles` flag. Each ghost independently selects a role (Chaser, Blocker, or Ambusher) using epsilon-greedy exploration and acts according to that role.
+
+**Roles:**
+- **Chaser (C)**: Directly pursues Pac-Man
+- **Blocker (B)**: Blocks escape routes and corridors
+- **Ambusher (A)**: Positions ahead of predicted Pac-Man path
+
+**Train with roles:**
+```bash
+python train_ghosts.py --episodes 1000 --model dqn --use-roles --save-dir checkpoints_dqn_roles/
+```
+
+**Evaluate with role visualization:**
+When using `--render`, ghost roles are displayed as colored labels below each ghost:
+- **C** (red): Chaser
+- **B** (blue): Blocker  
+- **A** (green): Ambusher
+
+```bash
+python train_ghosts.py --episodes 10 --model dqn --load-dir checkpoints_dqn_roles/ --eval-only --render --fps 15 --use-roles
+```
+
+**Role reporting in comparison:**
+When using `compare_models.py` with `--use-roles`, the final comparison report includes ghost role assignments for each model.
+
+```bash
+python compare_models.py --use-roles --train-episodes 500 --test-episodes 50
+```
+
 ### 4. Log Moves for Analysis
 Run evaluation and save all moves to `evaluation_moves.txt`:
 ```bash
 python train_ghosts.py --episodes 50 --model dqn --load-dir checkpoints_dqn/ --eval-only --log-moves
+```
+
+### 5. Compare All Models (Scientific Comparison)
+To compare the performance of all multi-agent RL models with a single command, use `compare_models.py`. This script trains all 5 models (Q-Learning, MADDPG, DQN, PPO, QMIX) separately and evaluates them on the test map(s), then prints a comparison summary with uniform logging format.
+
+```bash
+# Basic usage with defaults (1000 train episodes, 100 test episodes, grid 30, map 0)
+python compare_models.py
+```
+
+**Custom configuration:**
+```bash
+# Set specific grid sizes, train maps, test maps, and episode counts
+python compare_models.py \
+    --grid-sizes 30 \
+    --train-maps 0,1,2 \
+    --test-maps 3,4,5 \
+    --train-episodes 1000 \
+    --test-episodes 100
+
+# Train on one map, test on another (cross-map evaluation)
+python compare_models.py --train-maps 0 --test-maps 3 --train-episodes 1000 --test-episodes 200
+
+# Use specific models only
+python compare_models.py --models qlearning,dqn,ppo --train-episodes 500 --test-episodes 50
+
+# Multiple grid sizes for training
+python compare_models.py --grid-sizes 20,30,40 --train-maps 0,2,4 --test-maps 1,3,5
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `--grid-sizes` | Comma-separated grid sizes for training (e.g., `20,30,40`) |
+| `--train-maps` | Comma-separated training map indices 0-5 (e.g., `0,1,2`) |
+| `--test-maps` | Comma-separated test map indices 0-5 (e.g., `3,4,5`) |
+| `--train-episodes` | Number of training episodes per model (default: 1000) |
+| `--test-episodes` | Number of evaluation episodes per model per test map (default: 100) |
+| `--ghosts` | Number of ghosts: 2 or 4 (default: 4) |
+| `--models` | Filter models to compare: qlearning,maddpg,dqn,ppo,qmix,vdn (default: all) |
+| `--config` | Path to config.json (default: config.json) |
+| `--no-save` | Do not save results to CSV |
+| `--pdf` | Generate PDF report with charts |
+| `--use-roles` | Enable role-based multi-head policy for all models |
+
+**Features:**
+- **Uniform logging**: All models display training progress in the same format
+- **Fair comparison**: All models train on the same sequence of maps and grid sizes (deterministic sequence with fixed seed)
+- **Structured output**: Comparison table sorted by ghost win rate, with best model highlighted
+- **Per-map breakdown**: Individual results for each test map
+- **CSV export**: Results saved to `model_comparison_YYYYMMDD_HHMMSS.csv`
+- **PDF report**: Optional PDF generation with `--pdf` flag (requires matplotlib)
+- **Role reporting**: When `--use-roles` is active, final roles are displayed for each ghost in the comparison report
+
+**Example Output:**
+```
+====================================================================
+MULTI-AGENT RL MODEL COMPARISON RESULTS
+====================================================================
+Test Maps: [0]
+Evaluation Date: 2026-03-21 08:30:56
+====================================================================
+
+Model          Ghost Wins   Pac-Man Wins  Ghost Win %   Avg Reward   Avg Length
+----------------------------------------------------------------------------------------------------
+1. Q-Learning          5              0       100.0%        508.1         39.6
+2. MADDPG              5              0       100.0%        581.8         86.8
+3. DQN                 5              0       100.0%        519.8         48.6
+4. PPO                 5              0       100.0%        517.7         47.6
+5. QMIX                5              0       100.0%        498.6         42.8
+----------------------------------------------------------------------------------------------------
+
+🏆 BEST MODEL: Q-Learning (100.0% ghost win rate)
+   - Ghost Wins: 5/5
+   - Average Reward: 508.06
+   - Average Episode Length: 39.6 steps
+
+====================================================================
+COMPARISON COMPLETE
+====================================================================
+
+📊 Results saved to: model_comparison_20260321_083056.csv
 ```
 
 ---
@@ -218,6 +350,24 @@ Notes:
 - Observation range is compared against the active episode grid size, so `observation.range >= grid_size` still means full observability.
 - Training logs now print the selected map and grid size for every episode.
 - Training results CSV exports include the configured train map list and train grid sizes for experiment comparison.
+
+---
+
+## Ghost Roles (Multi-Head Policy)
+
+All models use a **role-based multi-head policy** where each ghost independently picks a role:
+
+| Role | Behavior |
+|------|----------|
+| **Chaser** | Directly pursues Pac-Man |
+| **Blocker** | Blocks Pac-Man's escape routes |
+| **Ambusher** | Positions ahead of Pac-Man's predicted path |
+
+Ghosts learn role selection via epsilon-greedy exploration:
+- During training: Ghosts randomly try roles (exploration)
+- During evaluation: Ghosts use learned role preferences
+
+This enables emergent specialization - some ghosts become better chasers, others blockers.
 
 ---
 
@@ -332,16 +482,20 @@ To ensure robust behavior, the environment enforces:
 ## Project Structure
 ```
 rl_pacman/
+├── compare_models.py   # Scientific comparison tool - trains all models and compares results
 ├── pacman_game.py      # Core game logic, map generation, rendering
 ├── rl_utils.py         # Shared RL utilities (constants, state encoding, replay buffer)
 ├── train_ghosts.py     # Training loop, environment wrapper, CLI entry point
 ├── ghost_rl.py         # Backwards compatibility wrapper (re-exports from models/)
 ├── config.json         # Hyperparameters
+├── .gitignore          # Git ignore rules
 └── models/             # RL model implementations
     ├── __init__.py     # Package exports
+    ├── roles.py        # Ghost roles (Chaser/Blocker/Ambusher) multi-head policy
     ├── qlearning.py    # Q-Learning agent
     ├── maddpg.py       # MADDPG (Multi-Agent DDPG) agent
     ├── dqn.py          # Shared DQN (Deep Q-Network) agent
     ├── ppo.py          # PPO (Proximal Policy Optimization) agent
-    └── qmix.py         # QMIX (Factorized Multi-Agent Q-Learning) agent
+    ├── qmix.py         # QMIX (Factorized Multi-Agent Q-Learning) agent
+    └── vdn.py          # VDN (Value Decomposition Networks) agent
 ```
